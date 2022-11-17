@@ -312,9 +312,13 @@ mod parse_helper {
                             .flatten(),
                     )
                     .chain(
-                        just(',')
-                            .map_with_span(|_, span| (Ok(Token::Comma), span))
-                            .or_not(),
+                        whitespace()
+                            .then(
+                                just(',')
+                                    .map_with_span(|_, span| (Ok(Token::Comma), span))
+                                    .or_not(),
+                            )
+                            .map(|(_, v)| v),
                     ),
             )
             .or(end_error_parser(&TokenError::PropertyAssignment).map(|v| vec![v]));
@@ -621,7 +625,7 @@ mod parse_helper {
                 (Ok(Token::Comma), 8..9)
             ])
         );
-        let parsed = parser.parse("PROP=1,2, PROP=1,2");
+        let parsed = parser.parse("PROP=1,2 , PROP=1,2");
         assert_eq!(
             parsed,
             Ok(vec![
@@ -630,7 +634,7 @@ mod parse_helper {
                 (Ok(Token::Number(1.0)), 5..6),
                 (Ok(Token::Comma), 6..7),
                 (Ok(Token::Number(2.0)), 7..8),
-                (Ok(Token::Comma), 8..9)
+                (Ok(Token::Comma), 9..10)
             ])
         );
         let parsed = parser.parse("PROP='string");
