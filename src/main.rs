@@ -1,24 +1,28 @@
 mod completion;
 mod fds_classes;
+mod fds_defaults;
 mod parser;
 mod semantic_token;
 
 use completion::{get_completion_results, set_completion_response};
 use dashmap::DashMap;
 use fds_classes::FDSClass;
+use fds_defaults::FDSDefault;
 use parser::{Block, Script, Token};
 use ropey::{self, Rope};
 use semantic_token::convert_script_to_sematic_tokens;
+use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 #[derive(Debug)]
-struct Backend {
-    client: Client,
-    document_map: DashMap<String, Rope>,
-    fds_classes: DashMap<String, FDSClass>,
-    script_map: DashMap<String, Script>,
+pub struct Backend {
+    pub client: Client,
+    pub document_map: DashMap<String, Rope>,
+    pub fds_classes: DashMap<String, FDSClass>,
+    pub fds_defaults: Mutex<Vec<FDSDefault>>,
+    pub script_map: DashMap<String, Script>,
 }
 
 impl Backend {
@@ -38,13 +42,28 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format! {"{:?}", std::env::args()})
             .await;
 
-        let Some(path) = std::env::args().find(|f| f.starts_with("RUST_FDS_CLASSES_PATH")) else {return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_CLASSES_PATH was not found")))};
+        //MAYBE Make this optional in case the csv files are not included
+        let Some(fds_classes_path) = std::env::args().find(|f| f.starts_with("RUST_FDS_CLASSES_PATH")) else {return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_CLASSES_PATH was not found")))};
+        let Some(fds_classes_path) = fds_classes_path.split('=').last() else{ return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_CLASSES_PATH was defined wrong. '{fds_classes_path}'")))};
 
-        let Some(path) = path.split('=').last() else{ return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_CLASSES_PATH was defined wrong. '{path}'")))};
-
-        for class in fds_classes::get_classes(path) {
+        for class in fds_classes::get_classes(fds_classes_path) {
             self.fds_classes.insert(class.label.clone(), class);
         }
+
+        let Some(fds_defaults_path) = std::env::args().find(|f| f.starts_with("RUST_FDS_DEFAULTS_PATH")) else {return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_DEFAULTS_PATH was not found")))};
+        let Some(fds_defaults_path) = fds_defaults_path.split('=').last() else {return Err(tower_lsp::jsonrpc::Error::invalid_params(format!("Environment variable RUST_FDS_DEFAULTS_PATH was defined wrong. '{fds_defaults_path}'")))};
+
+        std::mem::swap(
+            self.fds_defaults.lock().await.as_mut(),
+            &mut fds_defaults::get_defaults(fds_defaults_path),
+        );
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Defaults:\n{:?}", self.fds_defaults),
+            )
+            .await;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -55,7 +74,8 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(true),
-                    trigger_characters: Some(vec!["&".to_string()]),
+                    trigger_characters: Some(vec!["&".to_string(), "=".to_string()]),
+                    all_commit_characters: None,
                     ..Default::default()
                 }),
                 // signature_help_provider: (),
@@ -176,17 +196,13 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         if let Some(script) = self.script_map.get(&uri) {
-            return Ok(get_completion_results(
-                &self.fds_classes,
-                script.value(),
-                pos,
-            ));
+            return Ok(get_completion_results(self, script.value(), pos).await);
         }
         Ok(None)
     }
 
     async fn completion_resolve(&self, mut params: CompletionItem) -> Result<CompletionItem> {
-        set_completion_response(&self.fds_classes, &mut params);
+        set_completion_response(self, &mut params).await;
         Ok(params)
     }
 
@@ -260,6 +276,7 @@ async fn main() {
         client,
         document_map: DashMap::default(),
         fds_classes: DashMap::default(),
+        fds_defaults: Mutex::new(Vec::default()),
         script_map: DashMap::default(),
     });
     Server::new(stdin, stdout, socket).serve(service).await;

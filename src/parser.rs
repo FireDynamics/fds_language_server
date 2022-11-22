@@ -60,6 +60,26 @@ impl Block {
         }
         None
     }
+
+    pub fn get_recent_property(
+        &self,
+        pos: Position,
+    ) -> Option<(String, tower_lsp::lsp_types::Range)> {
+        let Block::Code( code) =self else { return None};
+        code.iter()
+            .filter_map(|(token, span)| match token {
+                Ok(Token::Property(property)) => Some((property, span)),
+                _ => None,
+            })
+            .rev()
+            .find_map(|(property, range)| {
+                if range.start <= pos {
+                    Some((property.clone(), range.clone()))
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 #[derive(Debug)]

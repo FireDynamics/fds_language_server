@@ -1,3 +1,5 @@
 Cargo.lock
 todo.md
 /target
+/data
+.gitignore
