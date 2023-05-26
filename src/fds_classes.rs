@@ -1,7 +1,28 @@
 use anyhow::Result;
-use serde_json::Value;
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+    ops::{Deref, DerefMut},
+    path::Path,
+};
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+
+use crate::{completion::CompletionItemValue, versions::Version};
+
+#[derive(Debug, Default)]
+pub struct FDSClasses(HashMap<String, FDSClass>);
+impl Deref for FDSClasses {
+    type Target = HashMap<String, FDSClass>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for FDSClasses {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug)]
 pub struct FDSClass {
@@ -13,23 +34,17 @@ pub struct FDSClass {
 
 impl FDSClass {
     fn try_new(content: &str) -> Result<FDSClass> {
-        let mut splits = content.split("\n");
+        let mut splits = content.split('\n');
 
-        let mut first_line = splits.next().expect("msg").split("\t"); //Empty
+        let mut first_line = splits.next().expect("msg").split('\t'); //Empty
         first_line.next();
         first_line.next(); // Number
-        let label = first_line.next().unwrap_or_else(|| "ERROR").to_string();
-        let definition = first_line
-            .next()
-            .unwrap_or_else(|| "No Definition")
-            .to_string();
+        let label = first_line.next().unwrap_or("ERROR").to_string();
+        let definition = first_line.next().unwrap_or("No Definition").to_string();
 
-        let mut second_line = splits.next().expect("msg").split("\t");
+        let mut second_line = splits.next().expect("msg").split('\t');
         second_line.next();
-        let reference = second_line
-            .next()
-            .unwrap_or_else(|| "No Reference")
-            .to_string();
+        let reference = second_line.next().unwrap_or("No Reference").to_string();
 
         let mut properties = HashMap::default();
         for split in splits {
@@ -39,7 +54,6 @@ impl FDSClass {
                 }
             }
         }
-        //
 
         Ok(FDSClass {
             label,
@@ -63,13 +77,13 @@ impl FDSClass {
         )
     }
 
-    pub fn get_completion_item(&self) -> CompletionItem {
+    pub fn get_completion_item(&self, version: Version) -> CompletionItem {
         let kind = Some(CompletionItemKind::CLASS);
         CompletionItem {
             label: self.label.clone(),
             //documentation,
             kind,
-            data: Some(Value::String(self.label.clone())),
+            data: Some(CompletionItemValue::Class { version }.into()),
             ..Default::default()
         }
     }
@@ -98,7 +112,7 @@ impl FDSClassProperty {
             }
         }
 
-        let mut splits = content.split("\t");
+        let mut splits = content.split('\t');
         let label = splits.next().expect("Name").to_string();
 
         let kind = get_next(splits.next());
@@ -142,25 +156,34 @@ impl FDSClassProperty {
         )
     }
 
-    pub fn get_completion_item(&self, source: String) -> CompletionItem {
+    pub fn get_completion_item(&self, class_name: String, version: Version) -> CompletionItem {
         let kind = Some(CompletionItemKind::CLASS);
         CompletionItem {
             label: self.label.clone(),
             //documentation,
             kind,
-            data: Some(Value::Array(vec![
-                Value::String(source),
-                Value::String(self.label.clone()),
-            ])),
+            data: Some(
+                CompletionItemValue::Property {
+                    version,
+                    class_name,
+                }
+                .into(),
+            ),
             ..Default::default()
         }
     }
 }
 
-pub fn get_classes(path: &str) -> Vec<FDSClass> {
+pub fn get_classes2<P: AsRef<Path>>(path: P) -> FDSClasses {
     let file = fs::read_to_string(path).expect("Should have been able to read the file");
 
+    let mut fds_classes = FDSClasses::default();
     let mut splits = file.split("##");
     splits.next();
-    splits.filter_map(|f| FDSClass::try_new(f).ok()).collect()
+    for s in splits {
+        if let Ok(ok) = FDSClass::try_new(s) {
+            fds_classes.insert(ok.label.clone(), ok);
+        }
+    }
+    fds_classes
 }

@@ -40,7 +40,7 @@ impl Block {
             Block::Code(code) => {
                 for (token, range) in code.iter() {
                     if range.start <= pos && range.end >= pos {
-                        return Some((token.clone(), range.clone()));
+                        return Some((token.clone(), *range));
                     }
                 }
                 None
@@ -61,6 +61,11 @@ impl Block {
         None
     }
 
+    pub fn is_class(&self, name: &str) -> bool {
+        let Some(get_name) = self.get_name() else { return false};
+        &get_name == name
+    }
+
     pub fn get_recent_property(
         &self,
         pos: Position,
@@ -74,7 +79,7 @@ impl Block {
             .rev()
             .find_map(|(property, range)| {
                 if range.start <= pos {
-                    Some((property.clone(), range.clone()))
+                    Some((property.clone(), *range))
                 } else {
                     None
                 }
@@ -99,13 +104,9 @@ impl Script {
             Err(err) => err
                 .into_iter()
                 .map(|f| {
-                    (
-                        Block::ParseError(match f.label() {
-                            Some(some) => Some(some.to_string()),
-                            None => None,
-                        }),
-                        { convert_span(f.span(), rope) },
-                    )
+                    (Block::ParseError(f.label().map(|some| some.to_string())), {
+                        convert_span(f.span(), rope)
+                    })
                 })
                 .collect::<Vec<_>>(),
         };
@@ -148,7 +149,7 @@ pub enum TokenError {
     End,
 }
 impl TokenError {
-    pub fn to_diagnostic(&self, range: tower_lsp::lsp_types::Range) -> Diagnostic {
+    pub fn get_diagnostic(&self, range: tower_lsp::lsp_types::Range) -> Diagnostic {
         let message = match self {
             TokenError::Class => "Immediately after a '&' a class is expected.",
             TokenError::Property => "A property is expected.",
@@ -157,15 +158,16 @@ impl TokenError {
             TokenError::End => "An end char could not be found. Did you forgot a '/'?",
         }
         .to_string();
-        let diagnostic = Diagnostic {
+
+        Diagnostic {
             range,
             message,
             ..Default::default()
-        };
-        diagnostic
+        }
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse<'a, Iter, S>(
     stream: S,
 ) -> Result<Vec<(ScriptBlock<Cheap<char>>, Range<usize>)>, Vec<Cheap<char>>>
@@ -318,12 +320,19 @@ mod parse_helper {
                             .ignored()
                             .map_with_span(|_, span| (Ok(Token::Comma), span))
                             .chain(
-                                just('T')
-                                    .or(just('F'))
-                                    .or(just('.'))
-                                    .or(just('-'))
-                                    .or(filter(char::is_ascii_digit))
-                                    .or(just('\'').or(just('"')))
+                                //Boolean
+                                just("T,")
+                                    .ignored()
+                                    .or(just("T ").ignored())
+                                    .or(just("F,").ignored())
+                                    .or(just("F ").ignored())
+                                    .or(just('.').ignored())
+                                    //Number
+                                    .or(just('-').ignored())
+                                    .or(filter(char::is_ascii_digit).ignored())
+                                    //String
+                                    .or(just('\'').ignored())
+                                    .or(just('"').ignored())
                                     .rewind()
                                     .to(None),
                             )
@@ -390,7 +399,14 @@ mod parse_helper {
                             .padded()
                             .repeated()
                             .flatten()
-                            .or(end_error_parser(&TokenError::Property).map(|v| vec![v])),
+                            .chain(whitespace().to(None))
+                            .chain(
+                                just('/')
+                                    .ignored()
+                                    .rewind()
+                                    .to(None)
+                                    .or(end_error_parser(&TokenError::Property).map(Some)),
+                            ), //.or(end_error_parser(&TokenError::Property).map(|v| vec![v])),
                     )
                     .or(end_error_parser(&TokenError::Class).map(|v| vec![v])),
             )
@@ -704,7 +720,7 @@ mod parse_helper {
             parsed,
             Ok((
                 ScriptBlock::Code(vec![
-                    (Ok(Token::Start), 0..3),
+                    (Ok(Token::Start), 2..3),
                     (Ok(Token::Class("CLASS".to_string())), 3..8),
                     (Ok(Token::Property("PROPERTY".to_string())), 10..18),
                     (Ok(Token::Equal), 18..21),

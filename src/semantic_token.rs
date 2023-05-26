@@ -16,14 +16,14 @@ pub const SEMANTIC_TOKEN_LEGEND: [lsp_types::SemanticTokenType; 8] = [
 ];
 
 pub enum SemanticTokenTypeIndex {
-    START,
-    CLASS,
-    PROPERTY,
-    BOOL,
-    STRING,
-    NUMBER,
-    END,
-    COMMENT,
+    Start,
+    Class,
+    Property,
+    Bool,
+    String,
+    Number,
+    End,
+    Comment,
 }
 
 impl SemanticTokenTypeIndex {
@@ -44,7 +44,7 @@ impl SemanticTokenTypeIndex {
     pub const _COUNT: usize = 7;
 
     pub fn _get_token_index_vector() -> Vec<u32> {
-        (0u32..Self::_COUNT as u32).into_iter().collect()
+        (0u32..Self::_COUNT as u32).collect()
     }
 }
 
@@ -74,7 +74,7 @@ pub fn convert_script_to_sematic_tokens(script: &Script) -> Vec<SemanticToken> {
             (start_line - *last_line, start_character)
         };
 
-        let length = end_character - start_character;
+        let length = end_character.saturating_sub(start_character);
 
         *last_line = start_line;
         *last_character = end_character;
@@ -98,7 +98,7 @@ pub fn convert_script_to_sematic_tokens(script: &Script) -> Vec<SemanticToken> {
                     delta_line,
                     delta_start,
                     length,
-                    token_type: SemanticTokenTypeIndex::COMMENT.value(),
+                    token_type: SemanticTokenTypeIndex::Comment.value(),
                     token_modifiers_bitset: 0,
                 };
 
@@ -112,13 +112,13 @@ pub fn convert_script_to_sematic_tokens(script: &Script) -> Vec<SemanticToken> {
                 })
                 .filter_map(|(token, range)| {
                     let token_type = match token {
-                        Token::Class(_) => Some(SemanticTokenTypeIndex::CLASS.value()),
-                        Token::Property(_) => Some(SemanticTokenTypeIndex::PROPERTY.value()),
-                        Token::Boolean(_) => Some(SemanticTokenTypeIndex::BOOL.value()),
-                        Token::String(_) => Some(SemanticTokenTypeIndex::STRING.value()),
-                        Token::Number(_) => Some(SemanticTokenTypeIndex::NUMBER.value()),
-                        Token::Start => Some(SemanticTokenTypeIndex::START.value()),
-                        Token::End => Some(SemanticTokenTypeIndex::END.value()),
+                        Token::Class(_) => Some(SemanticTokenTypeIndex::Class.value()),
+                        Token::Property(_) => Some(SemanticTokenTypeIndex::Property.value()),
+                        Token::Boolean(_) => Some(SemanticTokenTypeIndex::Bool.value()),
+                        Token::String(_) => Some(SemanticTokenTypeIndex::String.value()),
+                        Token::Number(_) => Some(SemanticTokenTypeIndex::Number.value()),
+                        Token::Start => Some(SemanticTokenTypeIndex::Start.value()),
+                        Token::End => Some(SemanticTokenTypeIndex::End.value()),
                         _ => None,
                     };
 
@@ -150,13 +150,13 @@ pub fn convert_script_to_sematic_tokens(script: &Script) -> Vec<SemanticToken> {
 
 #[test]
 fn test_token_conversion() {
-    assert_eq!(0, SemanticTokenTypeIndex::START.value());
-    assert_eq!(1, SemanticTokenTypeIndex::CLASS.value());
-    assert_eq!(2, SemanticTokenTypeIndex::PROPERTY.value());
-    assert_eq!(3, SemanticTokenTypeIndex::BOOL.value());
-    assert_eq!(4, SemanticTokenTypeIndex::STRING.value());
-    assert_eq!(5, SemanticTokenTypeIndex::NUMBER.value());
-    assert_eq!(6, SemanticTokenTypeIndex::END.value());
+    assert_eq!(0, SemanticTokenTypeIndex::Start.value());
+    assert_eq!(1, SemanticTokenTypeIndex::Class.value());
+    assert_eq!(2, SemanticTokenTypeIndex::Property.value());
+    assert_eq!(3, SemanticTokenTypeIndex::Bool.value());
+    assert_eq!(4, SemanticTokenTypeIndex::String.value());
+    assert_eq!(5, SemanticTokenTypeIndex::Number.value());
+    assert_eq!(6, SemanticTokenTypeIndex::End.value());
 }
 
 #[test]
