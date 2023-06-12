@@ -1,3 +1,5 @@
+//! Add auto completion support for the server.
+
 use std::{error::Error, fmt::Display, ops::Index};
 
 use serde_json::Value;
@@ -13,10 +15,14 @@ use crate::{
 
 use tower_lsp::jsonrpc::Result;
 
+/// The errors that can occur while auto completion
 #[derive(Debug)]
 pub enum CompletionResponseError {
+    /// The Script is missing
     NoScript(String),
+    /// No Version could be found
     NoVersion(String),
+    // No codeblock at a given Position
     NoBlockAtPosition(Position),
 }
 
@@ -48,6 +54,12 @@ impl From<CompletionResponseError> for tower_lsp::jsonrpc::Error {
     }
 }
 
+/// Get the completion response for all supported systems
+/// 
+/// Currently supported:
+/// - default classes and properties
+/// - default values
+/// - Context for classes with an `ID` property
 pub async fn get_completion_response(
     backend: &Backend,
     params: CompletionParams,
@@ -104,16 +116,18 @@ pub async fn get_completion_response(
     Ok(None)
 }
 
+/// Get the completion response for classes
 fn get_completion_classes(backend: &Backend, version: &Version) -> Option<CompletionResponse> {
     let items = backend
-        .fds_classes_map
-        .get(version)?
-        .values()
-        .map(|f| f.get_completion_item(*version))
-        .collect::<Vec<_>>();
-    Some(items.into())
+    .fds_classes_map
+    .get(version)?
+    .values()
+    .map(|f| f.get_completion_item(*version))
+    .collect::<Vec<_>>();
+Some(items.into())
 }
 
+/// Get the completion response for properties
 fn get_completion_properties(
     backend: &Backend,
     block: &Block,
@@ -130,6 +144,7 @@ fn get_completion_properties(
     Some(items.into())
 }
 
+/// Get the completion response for property values
 fn get_completion_equal(
     backend: &Backend,
     block: &Block,
@@ -160,84 +175,28 @@ fn get_completion_equal(
     Some(completion_items.into())
 }
 
-// pub async fn get_completion_results(
-//     backend: &Backend,
-//     script: &Script,
-//     version: &Version,
-//     pos: Position,
-// ) -> Option<CompletionResponse> {
-//     let block = script.get_block(pos)?;
-//     let result = block._get_token(pos);
-//     match result {
-//         //Classes
-//         Some((Ok(Token::Start), _)) | Some((Ok(Token::Class(_)), _)) => {
-//             let items = backend
-//                 .fds_classes_map
-//                 .get(version)?
-//                 .values()
-//                 .map(|f| f.get_completion_item(*version))
-//                 .collect::<Vec<_>>();
-//             return Some(items.into());
-//         }
-//         //Properties
-//         Some((Ok(Token::Property(_)), _))
-//         | Some((Err(TokenError::Property), _))
-//         | Some((Err(TokenError::End), _))
-//         | None => {
-//             let name = block.get_name()?;
-//             let class = backend.fds_classes_map.get(version)?;
-//             let class = class.get(&name)?;
-//             let items = class
-//                 .properties
-//                 .values()
-//                 .map(|v| v.get_completion_item(class.label.clone(), *version))
-//                 .collect::<Vec<_>>();
-//             return Some(items.into());
-//         }
-//         Some((Ok(Token::Equal), _))
-//         | Some((Ok(Token::Comma), _))
-//         | Some((Err(TokenError::PropertyValue), _)) => {
-//             let class = block.get_name()?;
-//             let (property, _) = block.get_recent_property(pos)?;
-
-//             let fds_defaults = backend.fds_defaults_map.get(version)?;
-
-//             let completion_items = fds_defaults
-//                 .iter()
-//                 .enumerate()
-//                 .filter(|(_, fds_default)| fds_default.is_item(&class, &property))
-//                 .flat_map(|(i, fds_default)| fds_default.get_completion_items(i, *version))
-//                 .collect::<Vec<_>>();
-
-//             if property.ends_with("_ID") {
-//                 let key = property[..(property.len() - 3)].to_string();
-//                 if let Some(context_map) = backend.context_map.get(&key) {}
-//             }
-
-//             return Some(completion_items.into());
-//         }
-//         _ => {
-//             backend
-//                 .client
-//                 .log_message(MessageType::INFO, "No completion item found.")
-//                 .await;
-//         }
-//     }
-
-//     None
-// }
-
+/// All errors that can occur by converting a [`Value`] to a [`CompletionItemValue`]
 #[derive(Debug)]
 pub enum CompletionItemValueError {
+    /// The root value is not an Array
     NotAnArray,
+    /// Unable to convert a value to a valide id
     NoSupportedId(u64),
+    /// The id value is missing
     NoId,
+    /// The version value is missing
     NoVersion(VersionValueError),
+    /// The class name is missing
     ClassNameMissing,
+    /// the index for a default name is missing
     DefaultNameIndexMissing,
+    /// the index for a default value is missing
     DefaultValueIndexMissing,
+    /// The line number is missing for the context
     LineNumberMissing,
+    /// The char number is missing for the context
     CharacterNumberMissing,
+    /// The array contains to many values
     ToManyValues,
 }
 impl Display for CompletionItemValueError {
@@ -279,22 +238,36 @@ impl Error for CompletionItemValueError {
     }
 }
 
+/// The the strictly typed value architecture  
 pub enum CompletionItemValue {
+    /// Architektur if the completion item is a class
     Class {
+        /// the version of the document
         version: Version,
     },
+    /// Architektur if the completion item is a property
     Property {
+        /// the version of the document
         version: Version,
+        /// the class name this property contains to
         class_name: String,
     },
+    /// Architektur if the completion item is a default value
     Default {
+        /// the version of the document
         version: Version,
+        /// The default name index
         name_index: usize,
+        /// The default value index
         value_index: usize,
     },
+    /// Architektur if the completion item is a context value
     Context {
+        /// The class name witch the context correspond to
         class_name: String,
+        /// The line where the context value starts
         line: u32,
+        /// The char where the context value starts
         character: u32,
         //TODO Range
     },
@@ -406,7 +379,9 @@ impl From<CompletionItemValue> for Value {
     }
 }
 
+/// Injects markdown to the selected completion response
 pub async fn set_completion_response(backend: &Backend, params: &mut CompletionItem) {
+    // Get the value of the current selected response
     let completion_item_value = match &params.data {
         Some(some) => some,
         None => {
@@ -421,6 +396,7 @@ pub async fn set_completion_response(backend: &Backend, params: &mut CompletionI
         }
     };
 
+    // convert the value to the strong typed CompletionItemValue
     let completion_item_value = match CompletionItemValue::try_from(completion_item_value) {
         Ok(ok) => ok,
         Err(err) => {
@@ -435,6 +411,7 @@ pub async fn set_completion_response(backend: &Backend, params: &mut CompletionI
         }
     };
 
+    // Get the markdown based on the value
     match completion_item_value {
         CompletionItemValue::Class { version } => {
             backend
