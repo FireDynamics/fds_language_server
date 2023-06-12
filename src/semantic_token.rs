@@ -1,9 +1,12 @@
+//! Semantic Tokens to handle code highlight.
+
 use std::mem::Discriminant;
 
 use tower_lsp::lsp_types::{self, Position, SemanticToken};
 
 use crate::parser::{self, Block, Script, Token};
 
+/// Array of all possible semantic tokens wich can be represented
 pub const SEMANTIC_TOKEN_LEGEND: [lsp_types::SemanticTokenType; 8] = [
     lsp_types::SemanticTokenType::new("start"),
     lsp_types::SemanticTokenType::CLASS,
@@ -15,21 +18,34 @@ pub const SEMANTIC_TOKEN_LEGEND: [lsp_types::SemanticTokenType; 8] = [
     lsp_types::SemanticTokenType::COMMENT,
 ];
 
+/// Enum version auf the semantic tokens
 pub enum SemanticTokenTypeIndex {
+    /// The Start Token represented by `&`
     Start,
+    /// The Class Token, also known as name list right after the start token
     Class,
+    /// The Property Token wich is always before a `=`
     Property,
+    /// The Boolean Token written as "T", "F", ".TRUE." or ".FALSE."
     Bool,
+    /// The String Token delimitered  by `"` or `'`
     String,
+    /// The Number Token wich represents any number
     Number,
+    /// The End Token represented by `/`
     End,
+    /// The Comment Token. Every Line that does not start with a Start Token or everything after the End Token.
     Comment,
 }
 
 impl SemanticTokenTypeIndex {
+    /// Converts itself to the corresponding Token number.
     pub fn value(self) -> u32 {
+        /// Helper union to convert from Token to number
         union Value {
+            ///
             discriminant: Discriminant<SemanticTokenTypeIndex>,
+            ///
             value: u32,
         }
 
@@ -40,19 +56,15 @@ impl SemanticTokenTypeIndex {
             .value
         }
     }
-
-    pub const _COUNT: usize = 7;
-
-    pub fn _get_token_index_vector() -> Vec<u32> {
-        (0u32..Self::_COUNT as u32).collect()
-    }
 }
 
+/// Get all semantic tokens from the script.
 pub fn convert_script_to_sematic_tokens(script: &Script) -> Vec<SemanticToken> {
     let mut last_line = 0;
     let mut last_character = 0;
     let mut last_length = 0;
 
+    /// Helper function to convert [`tower_lsp::lsp_types::Range`] to `delta_line`, `delta_start` and `length`.
     fn values_from_range(
         last_line: &mut u32,
         last_character: &mut u32,
