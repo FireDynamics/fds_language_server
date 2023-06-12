@@ -1,3 +1,5 @@
+//! Add support for auto completion of default values
+
 use std::{
     fs,
     ops::{Deref, DerefMut},
@@ -9,6 +11,7 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
 use crate::{completion::CompletionItemValue, versions::Version};
 
+/// Wrapper class for [`Vec<FDSDefault>`]
 #[derive(Debug, Default)]
 pub struct FDSDefaults(Vec<FDSDefault>);
 impl Deref for FDSDefaults {
@@ -24,16 +27,36 @@ impl DerefMut for FDSDefaults {
     }
 }
 
+/// A group of default values assigned to a property and optional a class.
 #[derive(Debug)]
 pub struct FDSDefault {
+    /// All classes witch can have this default values. If the vec is empty all classes can have the defaults.
     pub classes: Vec<String>,
+    /// All properties witch can have this default values.
     pub properties: Vec<String>,
-
+    /// The additional information a default value can have.
     pub information: Vec<String>,
+    /// All default values with information. The first item of a vec is the default value, every additional item is information.
     pub completion_items: Vec<Vec<String>>,
 }
 
 impl FDSDefault {
+    /// Tries to create a default value from a text chunk.
+    /// 
+    /// The chunk has to look like the following:
+    /// ```text
+    /// CTRL;FUNCTION_TYPE
+    /// FUNCTION_TYPE;Purpose;
+    /// ANY;Changes state if any INPUTs are .TRUE.;
+    /// ALL;Changes state if all INPUTs are .TRUE.;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if
+    /// - The describing line is missing containing of a optional class names split by `,` a `;` to separate and then the property names separated by `,`
+    /// - The describing line could not be parsed correctly
+    /// - The description row is missing
     pub fn try_new(content: &str) -> Result<Self> {
         let mut lines = content.split('\n').filter(|f| !f.is_empty());
         let Some(line1) = lines.next() else {return Err(anyhow::Error::msg("No first describing line found"))};
@@ -71,6 +94,7 @@ impl FDSDefault {
         })
     }
 
+    /// Create a list of completion items
     pub fn get_completion_items(&self, index: usize, version: Version) -> Vec<CompletionItem> {
         self.completion_items
             .iter()
@@ -99,6 +123,7 @@ impl FDSDefault {
             .collect::<Vec<_>>()
     }
 
+    /// Convert on default value to markdown.
     pub fn get_element_markdown(&self, index: usize) -> Option<String> {
         let mut iter_item = self.completion_items[index].iter();
         let mut iter_info = self.information.iter();
@@ -118,41 +143,14 @@ impl FDSDefault {
         Some(format!("`{}`  \n{}", label, info))
     }
 
-    //TODO Remove
-    // pub fn get_element_markdown(&self, name: &String) -> Option<String> {
-    //     if let Some(vec) = self
-    //         .completion_items
-    //         .iter()
-    //         .find(|f| f.first() == Some(name))
-    //     {
-    //         let mut iter_item = vec.iter();
-    //         let mut iter_info = self.information.iter();
-
-    //         let label = iter_item.next()?.clone();
-    //         let _ = iter_info.next()?;
-
-    //         let info = iter_info
-    //             .filter_map(|info| {
-    //                 iter_item
-    //                     .next()
-    //                     .map(|value| format!("**{}**: {}  ", info, value))
-    //             })
-    //             .collect::<Vec<_>>()
-    //             .join("\n");
-
-    //         Some(format!("`{}`  \n{}", label, info))
-    //     } else {
-    //         None
-    //     }
-    // }
-
-    //TODO Rename
+    /// Check if this struct fits the description of class and property name
     pub fn is_item(&self, class: &String, property: &String) -> bool {
         (self.classes.is_empty() || self.classes.contains(class))
             && self.properties.contains(property)
     }
 }
 
+/// Get [`FDSDefaults`] from a file
 pub fn get_defaults2<P: AsRef<Path>>(path: P) -> FDSDefaults {
     let file = fs::read_to_string(path).expect("Should have been able to read the file");
 
