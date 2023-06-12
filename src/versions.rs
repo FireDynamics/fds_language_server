@@ -1,4 +1,4 @@
-//!
+//! Submodule for construction and parsing [`Version`]s
 
 use std::{env, fmt::Display, num::ParseIntError, path::PathBuf, str::FromStr};
 
@@ -19,10 +19,14 @@ const FALLBACK_VERSION: Version = Version {
 /// The environment Variable that was passed to get the path to the save location of the data.
 const DATA_PATH_KEY: &str = "RUST_FDS_DATA_PATH";
 
+/// Error that occurs when the path for the files needs to be determined based on the [Version].
 #[derive(Debug, PartialEq, Eq)]
 pub enum VersionPathError {
+    /// The environment variable is not found
     MissingEnvironmentVariable,
+    /// The environment variable has an incorrect format
     EnvironmentVariableFormatting(String),
+    /// The version folder is not found, even the fallback version.
     MissingDataDirectory(Vec<Version>),
 }
 
@@ -57,12 +61,18 @@ impl std::error::Error for VersionPathError {
     }
 }
 
+/// Error that occurs when parsing a [`Version`] from text.
 #[derive(Debug)]
 pub enum VersionParseError {
+    /// No major version number could be found.
     NoMajorVersion,
+    /// The version is constructed of to many numbers.
     ToManyNumbers,
+    /// Major number could not be converted to int
     ParseMajor(ParseIntError),
+    /// Minor number could not be converted to int
     ParseMinor(ParseIntError),
+    /// Micro number could not be converted to int
     ParseMicro(ParseIntError),
 }
 impl Display for VersionParseError {
@@ -95,12 +105,18 @@ enum DetailLevel {
     Micro = 2,
 }
 
+/// Error that occurs when a [`Value`] could not be converted to a [`Version`]
 #[derive(Debug)]
 pub enum VersionValueError {
+    /// The root value is not an Array
     NotAnArray,
+    /// The first argument could not be converted to a major number
     NoMajor,
+    /// The second argument could not be converted to a minor number
     NoMinor,
+    /// The third argument could not be converted to a micro number
     NoMicro,
+    /// The root value array contains to many values
     ToManyValues,
 }
 impl Display for VersionValueError {
@@ -118,11 +134,14 @@ impl Display for VersionValueError {
 }
 impl std::error::Error for VersionValueError {}
 
-/// The data model of a version.
+/// The data model of a version. With a mandatory major number and optional minor and micro number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
+    /// The mandatory major number.
     major: u8,
+    /// The optional minor number.
     minor: Option<u8>,
+    /// The optional micro number.
     micro: Option<u8>,
 }
 impl Version {
@@ -338,6 +357,18 @@ impl From<u8> for Version {
     }
 }
 
+/// Parses a text with a starting version definition to a [`Version`].
+/// 
+/// The following leading names are possible to use
+/// - version 6.1.4
+/// - Version 6.1.4
+/// - VERSION 6.1.4
+/// - FDS 6.1.4
+/// 
+/// The version can be constructed like
+/// - 6
+/// - 6.1
+/// - 6.1.4
 pub fn version_parser<E: Error<char> + 'static>() -> impl Parser<char, Option<Version>, Error = E> {
     let parser = choice::<_, E>((
         just::<_, _, E>("version"),
@@ -387,6 +418,9 @@ pub fn version_parser<E: Error<char> + 'static>() -> impl Parser<char, Option<Ve
     parser
 }
 
+/// Gets the version wich should be used for the current file. The whole text 
+/// stream is passed to [`version_parser`]-function. If no version was not or 
+/// wrongly defined a fallback [`Version`] is used.
 pub fn get_version(stream: String) -> Result<(Version, PathBuf), VersionPathError> {
     let version = if let Ok(Some(version)) = version_parser::<Simple<char>>().parse(stream) {
         version
