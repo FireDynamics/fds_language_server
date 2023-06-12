@@ -1,3 +1,5 @@
+//! Add hover and auto completion support for classes and properties
+
 use anyhow::Result;
 use std::{
     collections::HashMap,
@@ -9,6 +11,7 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
 use crate::{completion::CompletionItemValue, versions::Version};
 
+/// A wrapper for [`HashMap<String, FDSClass>`]
 #[derive(Debug, Default)]
 pub struct FDSClasses(HashMap<String, FDSClass>);
 impl Deref for FDSClasses {
@@ -24,25 +27,47 @@ impl DerefMut for FDSClasses {
     }
 }
 
+
+/// A class FDS supports. Also known as namelist
 #[derive(Debug)]
 pub struct FDSClass {
+    /// The name of the class.
     pub label: String,
+    /// Information about the class.
     definition: String,
+    /// Reference information about the class.
     reference: String,
+    /// All supported properties of a class.
     pub properties: HashMap<String, FDSClassProperty>,
 }
 
 impl FDSClass {
+    /// Tries to create a fds class from a text chunk.
+    /// 
+    /// The chunk has to look like the following:
+    /// ```text
+    /// \t22.6\tCTRL\t(Control Function Parameters)
+    /// Reference:\tSection 20.5.
+    /// CONSTANT\tReal\tSection 20.5.6
+    /// DELAY\tReal\tSection 20.5.10\ts\t0.
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if
+    /// - The first and second line is missing.
     fn try_new(content: &str) -> Result<FDSClass> {
         let mut splits = content.split('\n');
 
-        let mut first_line = splits.next().expect("msg").split('\t'); //Empty
+        let Some(first_line) =  splits.next() else {return Err(anyhow::Error::msg("First line is missing"))};
+        let mut first_line = first_line.split('\t');
         first_line.next();
         first_line.next(); // Number
         let label = first_line.next().unwrap_or("ERROR").to_string();
         let definition = first_line.next().unwrap_or("No Definition").to_string();
 
-        let mut second_line = splits.next().expect("msg").split('\t');
+        let Some(second_line) = splits.next() else {return  Err(anyhow::Error::msg("Second line is missing"))};
+        let mut second_line = second_line.split('\t');
         second_line.next();
         let reference = second_line.next().unwrap_or("No Reference").to_string();
 
@@ -63,6 +88,7 @@ impl FDSClass {
         })
     }
 
+    /// Get the markdown representation from this class
     pub fn to_markdown_string(&self) -> String {
         format!(
             "## **`{}` {}**  \nFor more information see {}  \n\n## Properties  \n{}",
@@ -77,6 +103,7 @@ impl FDSClass {
         )
     }
 
+    /// Get the class name as completion item
     pub fn get_completion_item(&self, version: Version) -> CompletionItem {
         let kind = Some(CompletionItemKind::CLASS);
         CompletionItem {
@@ -89,17 +116,35 @@ impl FDSClass {
     }
 }
 
+/// A property a class can have.
 #[derive(Debug)]
 pub struct FDSClassProperty {
+    /// The name of the property
     pub label: String,
+    /// The user input type
     kind: Option<String>,
+    /// The reference information for the property
     reference: Option<String>,
+    /// The unit of the property
     unit: Option<String>,
+    /// The default value of the property
     default: Option<String>,
 }
 
 impl FDSClassProperty {
+    /// Tries to create a property from a text chunk.
+    ///
+    /// The chunk has to look like the following:
+    /// ```text
+    /// CONSTANT\tReal\tSection 20.5.6
+    /// ```
+    /// 
+    /// # Errors
+    ///
+    /// This function will return an error if 
+    /// - The string is empty.
     fn try_new(content: &str) -> Result<FDSClassProperty> {
+        /// Helper function to get the optional value from the next element in `splits`
         fn get_next(next: Option<&str>) -> Option<String> {
             if let Some(value) = next {
                 if value.is_empty() {
@@ -113,7 +158,8 @@ impl FDSClassProperty {
         }
 
         let mut splits = content.split('\t');
-        let label = splits.next().expect("Name").to_string();
+        let Some(label) = splits.next() else {return Err(anyhow::Error::msg("String is empty"))};
+        let label = label.to_string();
 
         let kind = get_next(splits.next());
         let reference = get_next(splits.next());
@@ -129,6 +175,7 @@ impl FDSClassProperty {
         })
     }
 
+    /// Get the markdown representation from this property
     pub fn to_markdown_string(&self) -> String {
         format!(
             "`{}`  \n{}{}{}{}",
@@ -156,6 +203,7 @@ impl FDSClassProperty {
         )
     }
 
+    /// Get the property name as completion item
     pub fn get_completion_item(&self, class_name: String, version: Version) -> CompletionItem {
         let kind = Some(CompletionItemKind::CLASS);
         CompletionItem {
@@ -174,6 +222,7 @@ impl FDSClassProperty {
     }
 }
 
+/// Get [`FDSClasses`] from a file
 pub fn get_classes2<P: AsRef<Path>>(path: P) -> FDSClasses {
     let file = fs::read_to_string(path).expect("Should have been able to read the file");
 
