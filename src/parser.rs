@@ -207,12 +207,19 @@ mod parse_helper {
         just('-')
             .or_not()
             .chain::<char, _, _>(
-                filter(char::is_ascii_digit).repeated().at_least(1).chain(
+                filter(char::is_ascii_digit).repeated().at_least(1)
+                .chain(
                     just('.')
-                        .chain(filter(char::is_ascii_digit).repeated().at_least(1))
+                        .chain(filter(char::is_ascii_digit).repeated())
                         .or_not()
-                        .flatten(),
-                ),
+                        .flatten()
+                        
+                    )
+                .chain(
+                    just('e').or(just('E'))
+                        .chain(just('-').or_not())
+                        .chain(filter(char::is_ascii_digit).repeated())
+                    )
             )
             .collect()
     }
