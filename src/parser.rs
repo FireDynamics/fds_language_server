@@ -1,3 +1,5 @@
+//! Parse the text to representing types
+
 use anyhow::Result;
 use chumsky::{error::Cheap, prelude::*, Error, Stream};
 use ropey::Rope;
@@ -6,12 +8,16 @@ use tower_lsp::lsp_types::{Diagnostic, Position};
 
 use self::parse_helper::script_parser;
 
+/// Representation of a chunk of the script. It is either a comment or code.
 #[derive(Debug, PartialEq, Clone)]
 enum ScriptBlock<E: Error<char>> {
+    /// Any comment. Every line that does not start with a `&` or after a `/` until code starts.
     Comment,
+    /// Everything inside `&` and `/` including the tokens
     Code(Vec<(Result<Token, TokenError>, E::Span)>),
 }
 impl ScriptBlock<Cheap<char>> {
+    /// Converts the [`ScriptBlock`] to [`Block`]
     fn convert_to_block(self, rope: &Rope) -> Block {
         match self {
             ScriptBlock::Comment => Block::Comment,
@@ -24,13 +30,22 @@ impl ScriptBlock<Cheap<char>> {
     }
 }
 
+/// Representation of a chunk of the script. It is either a comment, code or an error due to parsing.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Block {
+    /// Any comment. Every line that does not start with a `&` or after a `/` until code starts.
     Comment,
+    /// Everything inside `&` and `/` including the tokens
     Code(Vec<(Result<Token, TokenError>, tower_lsp::lsp_types::Range)>),
+    /// The error that occurred due to parsing
     ParseError(Option<String>),
 }
 impl Block {
+    /// Get tht token at a given posion. If the block is an comment or an parse error then [`None`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the underling code block has an error.
     pub fn _get_token(
         &self,
         pos: Position,
@@ -49,6 +64,7 @@ impl Block {
         }
     }
 
+    /// Get the class name of the block. Only returns [`Some`] if the block is code.
     pub fn get_name(&self) -> Option<String> {
         if let Block::Code(code) = self {
             if code.len() >= 2 {
@@ -61,11 +77,13 @@ impl Block {
         None
     }
 
+    /// Checks if the code block has a specific class.
     pub fn is_class(&self, name: &str) -> bool {
         let Some(get_name) = self.get_name() else { return false};
-        &get_name == name
+        get_name == name
     }
 
+    /// Geht the property name at a given position iside a block, Only returns [`Some`] if the block is code.
     pub fn get_recent_property(
         &self,
         pos: Position,
@@ -87,9 +105,11 @@ impl Block {
     }
 }
 
+/// The whole script, a collection of blocks.
 #[derive(Debug)]
 pub struct Script(Vec<(Block, tower_lsp::lsp_types::Range)>);
 impl Script {
+    /// Create the [`Script`] from a file.
     pub fn new(rope: &Rope) -> Self {
         let content = match parse(rope.to_string()) {
             Ok(ok) => ok
@@ -114,6 +134,7 @@ impl Script {
         Self(content)
     }
 
+    /// Get the code block at a position. Only returns [`Some`] if the position is inside the range.
     pub fn get_block(&self, pos: Position) -> Option<Block> {
         for (block, range) in self.0.iter() {
             if range.start <= pos && range.end >= pos {
@@ -123,32 +144,51 @@ impl Script {
         None
     }
 
+    /// Get the iter from the inner value.
     pub fn iter(&self) -> std::slice::Iter<(Block, tower_lsp::lsp_types::Range)> {
         self.0.iter()
     }
 }
+
+/// All relevant tokens a block is composed of.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
+    /// The start token represented by `&`
     Start,
+    /// The class token, any text after the start token
     Class(String),
+    /// The property toke, any text before `=`
     Property(String),
+    /// The number token, any kind of number
     Number(f32),
+    /// The bool token, one of `.TRUE.`, `.FALSE.`, `T` or `F`.
     Boolean(bool),
+    /// The string token, delimitered by `"` or `'`
     String(String),
+    /// The comma token represented by `,`
     Comma,
+    /// The equal token represented by `=`
     Equal,
+    /// The end token represented by `/`
     End,
 }
 
+/// All possible errors that can be found inside the use input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenError {
+    /// After the class token the class is missing.
     Class,
+    /// When a property is expected but none was found.
     Property,
+    /// When the property was defined, but no assignment is happening.
     PropertyAssignment,
+    /// The value of a property has an unknown type
     PropertyValue,
+    /// The end char is missing
     End,
 }
 impl TokenError {
+    /// Converts a [`TokenError`] to a [`Diagnostic`]
     pub fn get_diagnostic(&self, range: tower_lsp::lsp_types::Range) -> Diagnostic {
         let message = match self {
             TokenError::Class => "Immediately after a '&' a class is expected.",
@@ -168,6 +208,7 @@ impl TokenError {
 }
 
 #[allow(clippy::type_complexity)]
+/// Parses the script to a [`ScriptBlock`]
 fn parse<'a, Iter, S>(
     stream: S,
 ) -> Result<Vec<(ScriptBlock<Cheap<char>>, Range<usize>)>, Vec<Cheap<char>>>
@@ -178,6 +219,7 @@ where
     script_parser::<Cheap<char>>().parse(stream)
 }
 
+/// Convert a absolute text position to a `lsp_types` [`Position`]
 fn convert_position(pos: usize, rope: &Rope) -> Position {
     let l = rope.char_to_line(pos);
     let c = pos - rope.line_to_char(l);
@@ -185,6 +227,7 @@ fn convert_position(pos: usize, rope: &Rope) -> Position {
     Position::new(l as u32, c as u32)
 }
 
+/// Converts a `chumsky` text span to a `lsp_types` range
 fn convert_span(span: Range<usize>, rope: &Rope) -> tower_lsp::lsp_types::Range {
     tower_lsp::lsp_types::Range::new(
         convert_position(span.start, rope),
@@ -193,15 +236,29 @@ fn convert_span(span: Range<usize>, rope: &Rope) -> tower_lsp::lsp_types::Range 
 }
 
 mod parse_helper {
+    //! Private module to separate the token parser.
+    
     #![allow(private_in_public)]
+    
     use super::{ScriptBlock, Token, TokenError};
     use chumsky::{prelude::*, text::whitespace, Error};
 
+    /// Parser for a class name after the start token.
     #[inline]
     fn class_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
         filter(char::is_ascii_alphabetic).repeated().collect()
     }
 
+    /// Parse a number
+    /// 
+    /// Supported:
+    /// - `12345`
+    /// - `-1234`
+    /// - `12.45`
+    /// - `1245.`
+    /// - `12E45`
+    /// - `12e45`
+    /// - `12E-5`
     #[inline]
     fn number_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
         just('-')
@@ -224,6 +281,13 @@ mod parse_helper {
             .collect()
     }
 
+    /// Parse a boolean
+    /// 
+    /// Supported:
+    /// - `T`
+    /// - `F`
+    /// - `.TRUE.`
+    /// - `.FALSE.`
     #[inline]
     fn bool_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
         just("T")
@@ -233,6 +297,11 @@ mod parse_helper {
             .map(|s| s.to_string())
     }
 
+    /// Parse a string
+    /// 
+    /// Supported:
+    /// - `""`
+    /// - `''`
     #[inline]
     fn string_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
         let single_quote = take_until(
@@ -266,6 +335,13 @@ mod parse_helper {
             .or(double_quote)
     }
 
+    /// Parse a name
+    /// 
+    /// Supported
+    /// - `NAME`
+    /// - `NAME(3)`
+    /// - `NAME(3:3)`
+    /// - `NAME(3,3)`
     //MAYBE Split Property content
     #[inline]
     fn property_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
@@ -283,6 +359,12 @@ mod parse_helper {
             .collect()
     }
 
+    /// Parse one value of a property
+    /// 
+    /// Supported:
+    /// - number
+    /// - boolean
+    /// - string
     #[inline]
     fn property_value_parser<E: Error<char>>(
     ) -> impl Parser<char, Vec<(Result<Token, TokenError>, E::Span)>, Error = E> {
@@ -309,6 +391,7 @@ mod parse_helper {
             .or(end_error_parser(&TokenError::PropertyValue).map(|v| vec![v]))
     }
 
+    /// Parse a property with every assigned values.
     #[inline]
     fn property_assignment_parser<E: Error<char>>(
     ) -> impl Parser<char, Vec<(Result<Token, TokenError>, E::Span)>, Error = E> {
@@ -362,6 +445,7 @@ mod parse_helper {
         property_parser.chain(property_assignment)
     }
 
+    /// Parse the end of a command block.
     #[inline]
     fn end_parser<E: Error<char>>(
     ) -> impl Parser<char, (Result<Token, TokenError>, E::Span), Error = E> {
@@ -372,6 +456,7 @@ mod parse_helper {
                 .map_with_span(|_, span| (Err(TokenError::End), span)))
     }
 
+    /// Parse the end, if it is an error.
     #[inline]
     fn end_error_parser<E: Error<char>>(
         err: &'static TokenError,
@@ -386,6 +471,7 @@ mod parse_helper {
         .map_with_span(|_, span| (Err(*err), span))
     }
 
+    /// Parse a whole code block.
     #[inline]
     fn script_block_code_parser<E: Error<char> + Clone>(
     ) -> impl Parser<char, (ScriptBlock<E>, E::Span), Error = E> {
@@ -421,6 +507,7 @@ mod parse_helper {
             .map_with_span(|v, span| (ScriptBlock::<E>::Code(v), span))
     }
 
+    /// Parse a comment.
     #[inline]
     fn script_block_comment_parser<E: Error<char> + Clone>(
     ) -> impl Parser<char, (ScriptBlock<E>, E::Span), Error = E> {
@@ -434,6 +521,7 @@ mod parse_helper {
             .map(|(v, _)| v)
     }
 
+    /// Parse the whole script.
     #[inline]
     pub(super) fn script_parser<E: Error<char> + Clone>(
     ) -> impl Parser<char, Vec<(ScriptBlock<E>, E::Span)>, Error = E> {
