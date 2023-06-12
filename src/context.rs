@@ -1,3 +1,5 @@
+//! Add auto completion support for user defined IDs
+
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -10,16 +12,21 @@ use crate::{
     parser::{Script, Token},
 };
 
+/// A item that can be referenced.
 #[derive(Debug)]
 pub struct Context {
+    /// The value of the item.
     pub name: String,
+    /// The position of the item.
     pub range: Range,
 }
 
+/// A wrapper for [`HashMap<String, Vec<Context>>`]. Containing a Hash map of the class name and all corresponding ids.
 #[derive(Debug, Default)]
 pub struct ContextMap(HashMap<String, Vec<Context>>);
 
 impl ContextMap {
+    /// Get all defined contexts for a given class as completion items
     pub fn get_completion_items(&self, class: &String) -> Vec<CompletionItem> {
         if let Some(vec) = self.get(class) {
             vec.iter()
@@ -56,6 +63,7 @@ impl DerefMut for ContextMap {
     }
 }
 
+/// Get the [`ContextMap`] from the script.
 pub fn get_context(script: &Script) -> ContextMap {
     let mut content_map = ContextMap::default();
 
