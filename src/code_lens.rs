@@ -1,3 +1,5 @@
+//! Add code lens support for the server
+
 use std::fmt::Display;
 
 use crate::parser::{Script, Token};
@@ -6,9 +8,12 @@ use tower_lsp::jsonrpc::Error;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{CodeLens, CodeLensParams, Command, Position, Range};
 
+/// Errors that can occur when trying to display the code lens
 #[derive(Debug)]
 enum CodeLensError {
+    /// Unable to load version info
     NoVersion(String),
+    /// Unable to load script
     NoScript(String),
 }
 
@@ -37,6 +42,7 @@ impl From<CodeLensError> for Error {
     }
 }
 
+/// Add codelens to the current document
 pub async fn code_lens(backend: &Backend, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
     let uri = params.text_document.uri.to_string();
     let Some(version) = backend.get_version(&uri) else {
@@ -59,6 +65,7 @@ pub async fn code_lens(backend: &Backend, params: CodeLensParams) -> Result<Opti
     Ok(Some(code_lenses))
 }
 
+/// Display the fds version used for the current file.
 fn version_lens(version: Version, code_lenses: &mut Vec<CodeLens>) {
     code_lenses.push(CodeLens {
         range: Range {
@@ -80,6 +87,7 @@ fn version_lens(version: Version, code_lenses: &mut Vec<CodeLens>) {
     });
 }
 
+/// Calculate all infos necessary to display the cell size info
 fn cell_size_lens(script: &Script, code_lenses: &mut Vec<CodeLens>){
     let mut total_cells = 0.0;
 
