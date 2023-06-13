@@ -14,6 +14,7 @@ mod fds_defaults;
 mod parser;
 mod semantic_token;
 mod versions;
+mod formatting;
 
 use completion::{get_completion_response, set_completion_response};
 use context::ContextMap;
@@ -156,7 +157,7 @@ impl LanguageServer for Backend {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(true),
                 }),
-                // document_formatting_provider: (),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 // document_range_formatting_provider: (),
                 // document_on_type_formatting_provider: (),
                 // rename_provider: (),
@@ -396,6 +397,10 @@ impl LanguageServer for Backend {
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         code_lens::code_lens(self, params).await
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        formatting::formatting(self, params).await
     }
 }
 
