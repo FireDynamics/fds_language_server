@@ -1,37 +1,34 @@
 //! Add formatting support
 
-use std::fmt::Display;
-
 use crate::Backend;
 
-use chumsky::error::Cheap;
-use chumsky::prelude::*;
-use chumsky::text::ident;
-use tower_lsp::jsonrpc::{Error, Result};
-use tower_lsp::lsp_types::{DocumentFormattingParams, TextEdit};
+use chumsky::{
+    error::Cheap,
+    text::{ident, TextParser},
+    Parser,
+};
+use std::fmt::Display;
+use tower_lsp::{
+    jsonrpc::{Error, Result},
+    lsp_types::{DocumentFormattingParams, TextEdit},
+};
 
 /// Errors that can occur when trying to display the code lens
 #[derive(Debug)]
 enum FormattingError {
-    /// Unable to load version info
-    NoVersion(String),
+    /// Unable to load document
+    NoRope(String),
     /// Unable to load script
     NoScript(String),
-    /// Error inside the User input
-    ParseError,
 }
 impl Display for FormattingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FormattingError::NoVersion(document) => write!(
-                f,
-                "version for the current document could not be found '{document}'"
-            ),
+            FormattingError::NoRope(rope) => write!(f, "document could not be found '{rope}'"),
             FormattingError::NoScript(document) => write!(
                 f,
                 "script for the current document could not be found '{document}'"
             ),
-            FormattingError::ParseError => write!(f, "some error inside user input"),
         }
     }
 }
@@ -52,7 +49,9 @@ pub async fn formatting(
 ) -> Result<Option<Vec<TextEdit>>> {
     let uri = params.text_document.uri.to_string();
     let Some(rope) = backend.document_map.get(&uri) else{
-        todo!("Error")
+        let err = FormattingError::NoRope(uri);
+        backend.error(format!("{err}")).await;
+        return Err(err.into());
     };
     let rope = rope.value();
     let Some(script) = backend.script_map.get(&uri) else{
@@ -82,7 +81,8 @@ pub async fn formatting(
                     crate::parser::Token::Start => {}
                     crate::parser::Token::Class(class) => text.push(format!("&{class} ")),
                     crate::parser::Token::Property(property) => text.push(format!("{property} = ")),
-                    crate::parser::Token::Number(n) => {
+                    crate::parser::Token::Number(_) => {
+                        //HACK To support numbers like 12E12 they have to be cut from the raw document
                         let start = rope.line_to_char(range.start.line as usize)
                             + range.start.character as usize;
                         let end = rope.line_to_char(range.end.line as usize)
