@@ -237,9 +237,9 @@ fn convert_span(span: Range<usize>, rope: &Rope) -> tower_lsp::lsp_types::Range 
 
 mod parse_helper {
     //! Private module to separate the token parser.
-    
+
     #![allow(private_in_public)]
-    
+
     use super::{ScriptBlock, Token, TokenError};
     use chumsky::{prelude::*, text::whitespace, Error};
 
@@ -250,7 +250,7 @@ mod parse_helper {
     }
 
     /// Parse a number
-    /// 
+    ///
     /// Supported:
     /// - `12345`
     /// - `-1234`
@@ -264,25 +264,29 @@ mod parse_helper {
         just('-')
             .or_not()
             .chain::<char, _, _>(
-                filter(char::is_ascii_digit).repeated().at_least(1)
-                .chain(
-                    just('.')
-                        .chain(filter(char::is_ascii_digit).repeated())
-                        .or_not()
-                        .flatten()
-                        
+                filter(char::is_ascii_digit)
+                    .repeated()
+                    .at_least(1)
+                    .chain(
+                        just('.')
+                            .chain(filter(char::is_ascii_digit).repeated())
+                            .or_not()
+                            .flatten(),
                     )
-                .chain(
-                    just('e').or(just('E'))
-                        .chain(just('-').or_not())
-                        .chain(filter(char::is_ascii_digit).repeated())
-                    )
+                    .chain(
+                        just('e')
+                            .or(just('E'))
+                            .chain(just('-').or_not())
+                            .chain(filter(char::is_ascii_digit).repeated().at_least(1))
+                            .or_not()
+                            .flatten(),
+                    ),
             )
             .collect()
     }
 
     /// Parse a boolean
-    /// 
+    ///
     /// Supported:
     /// - `T`
     /// - `F`
@@ -298,7 +302,7 @@ mod parse_helper {
     }
 
     /// Parse a string
-    /// 
+    ///
     /// Supported:
     /// - `""`
     /// - `''`
@@ -336,7 +340,7 @@ mod parse_helper {
     }
 
     /// Parse a name
-    /// 
+    ///
     /// Supported
     /// - `NAME`
     /// - `NAME(3)`
@@ -360,7 +364,7 @@ mod parse_helper {
     }
 
     /// Parse one value of a property
-    /// 
+    ///
     /// Supported:
     /// - number
     /// - boolean
