@@ -8,20 +8,20 @@ use tower_lsp::lsp_types::{Diagnostic, Position};
 
 use self::parse_helper::script_parser;
 
-/// Representation of a chunk of the script. It is either a comment or code.
+/// Private representation of a chunk of the script. It is either a comment or code. the range is the total range
 #[derive(Debug, PartialEq, Clone)]
-enum ScriptBlock<E: Error<char>> {
+enum RopeBlock {
     /// Any comment. Every line that does not start with a `&` or after a `/` until code starts.
     Comment,
     /// Everything inside `&` and `/` including the tokens
-    Code(Vec<(Result<Token, TokenError>, E::Span)>),
+    Code(Vec<(Result<Token, TokenError>, Range<usize>)>),
 }
-impl ScriptBlock<Cheap<char>> {
+impl RopeBlock {
     /// Converts the [`ScriptBlock`] to [`Block`]
     fn convert_to_block(self, rope: &Rope) -> Block {
         match self {
-            ScriptBlock::Comment => Block::Comment,
-            ScriptBlock::Code(code) => Block::Code(
+            RopeBlock::Comment => Block::Comment,
+            RopeBlock::Code(code) => Block::Code(
                 code.into_iter()
                     .map(|(script_block, span)| (script_block, convert_span(span, rope)))
                     .collect::<Vec<_>>(),
@@ -209,14 +209,12 @@ impl TokenError {
 
 #[allow(clippy::type_complexity)]
 /// Parses the script to a [`ScriptBlock`]
-fn parse<'a, Iter, S>(
-    stream: S,
-) -> Result<Vec<(ScriptBlock<Cheap<char>>, Range<usize>)>, Vec<Cheap<char>>>
+fn parse<'a, Iter, S>(stream: S) -> Result<Vec<(RopeBlock, Range<usize>)>, Vec<Cheap<char>>>
 where
     Iter: Iterator<Item = (char, Range<usize>)> + 'a,
     S: Into<Stream<'a, char, Range<usize>, Iter>>,
 {
-    script_parser::<Cheap<char>>().parse(stream)
+    script_parser().parse(stream)
 }
 
 /// Convert a absolute text position to a `lsp_types` [`Position`]
@@ -240,12 +238,14 @@ mod parse_helper {
 
     #![allow(private_in_public)]
 
-    use super::{ScriptBlock, Token, TokenError};
-    use chumsky::{prelude::*, text::whitespace, Error};
+    use std::ops::Range;
+
+    use super::{RopeBlock, Token, TokenError};
+    use chumsky::{error::Cheap, prelude::*, text::whitespace, Error};
 
     /// Parser for a class name after the start token.
     #[inline]
-    fn class_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
+    fn class_parser() -> impl Parser<char, String, Error = Cheap<char>> {
         filter(char::is_ascii_alphabetic).repeated().collect()
     }
 
@@ -260,7 +260,7 @@ mod parse_helper {
     /// - `12e45`
     /// - `12E-5`
     #[inline]
-    fn number_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
+    fn number_parser() -> impl Parser<char, String, Error = Cheap<char>> {
         just('-')
             .or_not()
             .chain::<char, _, _>(
@@ -293,7 +293,7 @@ mod parse_helper {
     /// - `.TRUE.`
     /// - `.FALSE.`
     #[inline]
-    fn bool_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
+    fn bool_parser() -> impl Parser<char, String, Error = Cheap<char>> {
         just("T")
             .or(just("F"))
             .or(just(".TRUE."))
@@ -307,7 +307,7 @@ mod parse_helper {
     /// - `""`
     /// - `''`
     #[inline]
-    fn string_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
+    fn string_parser() -> impl Parser<char, String, Error = Cheap<char>> {
         let single_quote = take_until(
             none_of('\\')
                 .then(just('\'').ignored().rewind())
@@ -348,7 +348,7 @@ mod parse_helper {
     /// - `NAME(3,3)`
     //MAYBE Split Property content
     #[inline]
-    fn property_parser<E: Error<char>>() -> impl Parser<char, String, Error = E> {
+    fn property_parser() -> impl Parser<char, String, Error = Cheap<char>> {
         let content = filter(char::is_ascii_digit)
             .repeated()
             .at_least(1)
@@ -370,11 +370,12 @@ mod parse_helper {
     /// - boolean
     /// - string
     #[inline]
-    fn property_value_parser<E: Error<char>>(
-    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, E::Span)>, Error = E> {
-        let number_parser = number_parser::<E>()
+    fn property_value_parser(
+    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, Range<usize>)>, Error = Cheap<char>>
+    {
+        let number_parser = number_parser()
             .map_with_span(|s, span| vec![(Ok(Token::Number(s.parse().unwrap())), span)]);
-        let boolean_parser = bool_parser::<E>().map_with_span(|s, span| {
+        let boolean_parser = bool_parser().map_with_span(|s, span| {
             vec![(
                 Ok(Token::Boolean(match s.as_str() {
                     "T" => true,
@@ -387,7 +388,7 @@ mod parse_helper {
             )]
         });
         let string_parser =
-            string_parser::<E>().map_with_span(|s, span| vec![(Ok(Token::String(s)), span)]);
+            string_parser().map_with_span(|s, span| vec![(Ok(Token::String(s)), span)]);
 
         boolean_parser
             .or(number_parser)
@@ -397,9 +398,10 @@ mod parse_helper {
 
     /// Parse a property with every assigned values.
     #[inline]
-    fn property_assignment_parser<E: Error<char>>(
-    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, E::Span)>, Error = E> {
-        let property_parser = property_parser::<E>()
+    fn property_assignment_parser(
+    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, Range<usize>)>, Error = Cheap<char>>
+    {
+        let property_parser = property_parser()
             .map_with_span(|s, span| (Ok(Token::Property(s.parse().unwrap())), span));
 
         let property_assignment = just('=')
@@ -407,7 +409,7 @@ mod parse_helper {
             .padded()
             .map_with_span(|_, span| (Ok(Token::Equal), span))
             .chain(
-                property_value_parser::<E>()
+                property_value_parser()
                     .chain(
                         just(',')
                             .padded()
@@ -430,7 +432,7 @@ mod parse_helper {
                                     .rewind()
                                     .to(None),
                             )
-                            .chain(property_value_parser::<E>())
+                            .chain(property_value_parser())
                             .repeated()
                             .flatten(),
                     )
@@ -451,8 +453,8 @@ mod parse_helper {
 
     /// Parse the end of a command block.
     #[inline]
-    fn end_parser<E: Error<char>>(
-    ) -> impl Parser<char, (Result<Token, TokenError>, E::Span), Error = E> {
+    fn end_parser(
+    ) -> impl Parser<char, (Result<Token, TokenError>, Range<usize>), Error = Cheap<char>> {
         whitespace()
             .then(just('/').map_with_span(|_, span| (Ok(Token::End), span)))
             .map(|(_, v)| v)
@@ -462,9 +464,9 @@ mod parse_helper {
 
     /// Parse the end, if it is an error.
     #[inline]
-    fn end_error_parser<E: Error<char>>(
+    fn end_error_parser(
         err: &'static TokenError,
-    ) -> impl Parser<char, (Result<Token, TokenError>, E::Span), Error = E> {
+    ) -> impl Parser<char, (Result<Token, TokenError>, Range<usize>), Error = Cheap<char>> {
         take_until(
             just('/')
                 .ignored()
@@ -477,16 +479,16 @@ mod parse_helper {
 
     /// Parse a whole code block.
     #[inline]
-    fn script_block_code_parser<E: Error<char> + Clone>(
-    ) -> impl Parser<char, (ScriptBlock<E>, E::Span), Error = E> {
+    fn script_block_code_parser(
+    ) -> impl Parser<char, (RopeBlock, Range<usize>), Error = Cheap<char>> {
         let code_start_parser = whitespace()
             .then(just('&').map_with_span(|_, span| (Ok(Token::Start), span)))
             .map(|(_, v)| v);
 
-        let property_parser = property_assignment_parser::<E>();
+        let property_parser = property_assignment_parser();
 
         let class_parser =
-            class_parser::<E>().map_with_span(|s, span| vec![(Ok(Token::Class(s)), span)]);
+            class_parser().map_with_span(|s, span| vec![(Ok(Token::Class(s)), span)]);
 
         code_start_parser
             .chain(
@@ -508,27 +510,27 @@ mod parse_helper {
                     .or(end_error_parser(&TokenError::Class).map(|v| vec![v])),
             )
             .chain(end_parser())
-            .map_with_span(|v, span| (ScriptBlock::<E>::Code(v), span))
+            .map_with_span(|v, span| (RopeBlock::Code(v), span))
     }
 
     /// Parse a comment.
     #[inline]
-    fn script_block_comment_parser<E: Error<char> + Clone>(
-    ) -> impl Parser<char, (ScriptBlock<E>, E::Span), Error = E> {
+    fn script_block_comment_parser(
+    ) -> impl Parser<char, (RopeBlock, Range<usize>), Error = Cheap<char>> {
         none_of('\n')
             .then(take_until(
-                just::<_, _, E>('\n').rewind().ignored().or(end()),
+                just::<_, _, _>('\n').rewind().ignored().or(end()),
             ))
             .ignored()
-            .map_with_span(|_, span| (ScriptBlock::Comment, span))
+            .map_with_span(|_, span| (RopeBlock::Comment, span))
             .then(just('\n').or_not())
             .map(|(v, _)| v)
     }
 
     /// Parse the whole script.
     #[inline]
-    pub(super) fn script_parser<E: Error<char> + Clone>(
-    ) -> impl Parser<char, Vec<(ScriptBlock<E>, E::Span)>, Error = E> {
+    pub(super) fn script_parser(
+    ) -> impl Parser<char, Vec<(RopeBlock, Range<usize>)>, Error = Cheap<char>> {
         script_block_code_parser()
             .or(script_block_comment_parser().padded())
             .repeated()
@@ -537,13 +539,13 @@ mod parse_helper {
 
     #[test]
     fn test_class_parser() {
-        let parser = class_parser::<Simple<char>>();
+        let parser = class_parser();
         assert_eq!(parser.parse("TEST"), Ok("TEST".to_string()),);
     }
 
     #[test]
     fn test_number_parser() {
-        let parser = number_parser::<Simple<char>>();
+        let parser = number_parser();
         assert_eq!(
             parser.parse("10"),
             Ok("10".to_string()),
@@ -567,7 +569,7 @@ mod parse_helper {
 
     #[test]
     fn test_boolean_parser() {
-        let parser = bool_parser::<Simple<char>>();
+        let parser = bool_parser();
         assert_eq!(
             parser.parse("T"),
             Ok("T".to_string()),
@@ -597,7 +599,7 @@ mod parse_helper {
 
     #[test]
     fn test_string_parser() {
-        let parser = string_parser::<Simple<char>>();
+        let parser = string_parser();
         assert_eq!(
             parser.parse("''"),
             Ok("".to_string()),
@@ -630,7 +632,7 @@ mod parse_helper {
 
     #[test]
     fn test_property_parser() {
-        let parser = property_parser::<Simple<char>>();
+        let parser = property_parser();
         assert_eq!(
             parser.parse("TEST_PROPERTY"),
             Ok("TEST_PROPERTY".to_string()),
@@ -660,7 +662,7 @@ mod parse_helper {
 
     #[test]
     fn test_end_parser() {
-        let parser = end_parser::<Simple<char>>();
+        let parser = end_parser();
         assert_eq!(
             parser.parse("   / Some Comment"),
             Ok((Ok(Token::End), 3..4))
@@ -673,7 +675,7 @@ mod parse_helper {
     #[test]
 
     fn test_end_error_parser() {
-        let parser = end_error_parser::<Simple<char>>(&TokenError::End);
+        let parser = end_error_parser(&TokenError::End);
         assert_eq!(
             parser.parse("Some Text that could not be parsed / Some Comment"),
             Ok((Err(TokenError::End), 0..35))
@@ -682,23 +684,23 @@ mod parse_helper {
 
     #[test]
     fn test_script_comment_parser() {
-        let parser = script_block_comment_parser::<Simple<char>>();
+        let parser = script_block_comment_parser();
         assert_eq!(
             parser.parse("Some Comment\nMore Comment"),
-            Ok((ScriptBlock::Comment, 0..12))
+            Ok((RopeBlock::Comment, 0..12))
         );
         assert_eq!(
             parser.repeated().parse("Some Comment\nMore Comment"),
             Ok(vec![
-                (ScriptBlock::Comment, 0..12),
-                (ScriptBlock::Comment, 13..25)
+                (RopeBlock::Comment, 0..12),
+                (RopeBlock::Comment, 13..25)
             ])
         );
     }
 
     #[test]
     fn test_property_value_parser() {
-        let parser = property_value_parser::<Simple<char>>();
+        let parser = property_value_parser();
 
         let parsed = parser.parse("T");
         assert_eq!(parsed, Ok(vec![(Ok(Token::Boolean(true)), 0..1)]));
@@ -715,7 +717,7 @@ mod parse_helper {
 
     #[test]
     fn test_property_assignment_parser() {
-        let parser = property_assignment_parser::<Simple<char>>();
+        let parser = property_assignment_parser();
 
         let parsed = parser.parse("PROP=1");
         assert_eq!(
@@ -785,11 +787,11 @@ mod parse_helper {
 
     #[test]
     fn test_script_block_code_parser() {
-        let parsed = script_block_code_parser::<Simple<char>>().parse("&CLASS PROPERTY=.TRUE. /");
+        let parsed = script_block_code_parser().parse("&CLASS PROPERTY=.TRUE. /");
         assert_eq!(
             parsed,
             Ok((
-                ScriptBlock::Code(vec![
+                RopeBlock::Code(vec![
                     (Ok(Token::Start), 0..1),
                     (Ok(Token::Class("CLASS".to_string())), 1..6),
                     (Ok(Token::Property("PROPERTY".to_string())), 7..15),
@@ -800,11 +802,11 @@ mod parse_helper {
                 0..24
             ))
         );
-        let parsed = script_block_code_parser::<Simple<char>>().parse("&CLASSPROPERTY=.TRUE./");
+        let parsed = script_block_code_parser().parse("&CLASSPROPERTY=.TRUE./");
         assert_eq!(
             parsed,
             Ok((
-                ScriptBlock::Code(vec![
+                RopeBlock::Code(vec![
                     (Ok(Token::Start), 0..1),
                     (Ok(Token::Class("CLASSPROPERTY".to_string())), 1..14),
                     (Err(TokenError::Property), 14..21),
@@ -813,12 +815,11 @@ mod parse_helper {
                 0..22
             ))
         );
-        let parsed =
-            script_block_code_parser::<Simple<char>>().parse("  &CLASS  PROPERTY = 1 , 2 , 3/");
+        let parsed = script_block_code_parser().parse("  &CLASS  PROPERTY = 1 , 2 , 3/");
         assert_eq!(
             parsed,
             Ok((
-                ScriptBlock::Code(vec![
+                RopeBlock::Code(vec![
                     (Ok(Token::Start), 2..3),
                     (Ok(Token::Class("CLASS".to_string())), 3..8),
                     (Ok(Token::Property("PROPERTY".to_string())), 10..18),
@@ -837,13 +838,13 @@ mod parse_helper {
 
     #[test]
     fn test_script_parser() {
-        let parser = script_parser::<Simple<char>>();
+        let parser = script_parser();
         let parsed = parser.parse("Comment\nComment");
         assert_eq!(
             parsed,
             Ok(vec![
-                (ScriptBlock::Comment, 0..7),
-                (ScriptBlock::Comment, 8..15)
+                (RopeBlock::Comment, 0..7),
+                (RopeBlock::Comment, 8..15)
             ])
         );
         let parsed = parser.parse(
@@ -852,9 +853,9 @@ mod parse_helper {
         assert_eq!(
             parsed,
             Ok(vec![
-                (ScriptBlock::Comment, 0..7),
+                (RopeBlock::Comment, 0..7),
                 (
-                    ScriptBlock::Code(vec![
+                    RopeBlock::Code(vec![
                         (Ok(Token::Start), 8..9),
                         (Ok(Token::Class("CLASS".to_string())), 9..14),
                         (Ok(Token::Property("PROPERTY".to_string())), 15..23),
@@ -864,9 +865,9 @@ mod parse_helper {
                     ]),
                     8..26
                 ),
-                (ScriptBlock::Comment, 27..34),
+                (RopeBlock::Comment, 27..34),
                 (
-                    ScriptBlock::Code(vec![
+                    RopeBlock::Code(vec![
                         (Ok(Token::Start), 35..36),
                         (Ok(Token::Class("CLASS".to_string())), 36..41),
                         (Ok(Token::Property("PROPERTY".to_string())), 42..50),
@@ -876,9 +877,9 @@ mod parse_helper {
                     ]),
                     35..53
                 ),
-                (ScriptBlock::Comment, 54..61),
+                (RopeBlock::Comment, 54..61),
                 (
-                    ScriptBlock::Code(vec![
+                    RopeBlock::Code(vec![
                         (Ok(Token::Start), 62..63),
                         (Ok(Token::Class("CLASS".to_string())), 63..68),
                         (Ok(Token::Property("PROPERTY".to_string())), 69..77),
@@ -888,7 +889,7 @@ mod parse_helper {
                     ]),
                     62..80
                 ),
-                (ScriptBlock::Comment, 81..88)
+                (RopeBlock::Comment, 81..88)
             ])
         );
     }
