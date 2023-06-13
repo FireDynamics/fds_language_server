@@ -51,6 +51,10 @@ pub async fn formatting(
     params: DocumentFormattingParams,
 ) -> Result<Option<Vec<TextEdit>>> {
     let uri = params.text_document.uri.to_string();
+    let Some(rope) = backend.document_map.get(&uri) else{
+        todo!("Error")
+    };
+    let rope = rope.value();
     let Some(script) = backend.script_map.get(&uri) else{
         let err = FormattingError::NoScript(uri);
         backend.error(format!("{err}")).await;
@@ -68,7 +72,7 @@ pub async fn formatting(
         })
         .filter_map(|(code, range)| {
             let mut text = vec![];
-            for (res, _) in code {
+            for (res, range) in code {
                 let token = match res {
                     Ok(ok) => ok,
                     Err(_) => return None,
@@ -76,9 +80,16 @@ pub async fn formatting(
 
                 match token {
                     crate::parser::Token::Start => {}
-                    crate::parser::Token::Class(class) => text.push(format!("&{class}")),
+                    crate::parser::Token::Class(class) => text.push(format!("&{class} ")),
                     crate::parser::Token::Property(property) => text.push(format!("{property} = ")),
-                    crate::parser::Token::Number(n) => text.push(format!("{n}, ")),
+                    crate::parser::Token::Number(n) => {
+                        let start = rope.line_to_char(range.start.line as usize)
+                            + range.start.character as usize;
+                        let end = rope.line_to_char(range.end.line as usize)
+                            + range.end.character as usize;
+                        let n = rope.slice(start..end).to_string();
+                        text.push(format!("{n}, "))
+                    }
                     crate::parser::Token::Boolean(b) => {
                         if *b {
                             text.push(".TRUE., ".to_string())
@@ -99,7 +110,7 @@ pub async fn formatting(
                     .enumerate()
                     .map(|(i, s)| {
                         if i > 2 && ident::<_, Cheap<char>>().padded().parse(&s as &str).is_ok() {
-                            format!("\n\t{}", s)
+                            format!("\n      {}", s)
                         } else {
                             s
                         }
