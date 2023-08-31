@@ -42,7 +42,7 @@ pub struct FDSDefault {
 
 impl FDSDefault {
     /// Tries to create a default value from a text chunk.
-    /// 
+    ///
     /// The chunk has to look like the following:
     /// ```text
     /// CTRL;FUNCTION_TYPE
@@ -144,9 +144,9 @@ impl FDSDefault {
     }
 
     /// Check if this struct fits the description of class and property name
-    pub fn is_item(&self, class: &String, property: &String) -> bool {
-        (self.classes.is_empty() || self.classes.contains(class))
-            && self.properties.contains(property)
+    pub fn is_item(&self, class: &str, property: &str) -> bool {
+        (self.classes.is_empty() || self.classes.iter().any(|f| f as &str == class))
+            && self.properties.iter().any(|f| f as &str == property)
     }
 }
 

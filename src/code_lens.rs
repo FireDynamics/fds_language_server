@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 
-use crate::parser::{Script, Token};
+use crate::parser::{ScriptData, Token};
 use crate::{versions::Version, Backend};
 use tower_lsp::jsonrpc::Error;
 use tower_lsp::jsonrpc::Result;
@@ -88,52 +88,36 @@ fn version_lens(version: Version, code_lenses: &mut Vec<CodeLens>) {
 }
 
 /// Calculate all infos necessary to display the cell size info
-fn cell_size_lens(script: &Script, code_lenses: &mut Vec<CodeLens>){
+fn cell_size_lens(script: &ScriptData, code_lenses: &mut Vec<CodeLens>) {
     let mut total_cells = 0.0;
 
-    script
-        .iter()
-        .rev()
-        .filter_map(|(block, range)| match block {
-            crate::parser::Block::Code(code) => {
-                if block.is_class("MESH") {
-                    Some((code, range))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .for_each(|(code, _)| {
+    let mut iter = script.iter().map(|f| (f.span.lsp_span, &f.token));
+    while let Some((range, mesh)) = iter.next() {
+        if &Token::Class("MESH".to_string()) == mesh {
             let mut cells_x = 0.0;
             let mut cells_y = 0.0;
             let mut cells_z = 0.0;
             let mut size_x = 0.0;
             let mut size_y = 0.0;
             let mut size_z = 0.0;
-
-            let mut code = code.iter();
-            code.next();
-            let Some((_, range)) = code.next() else { return;};
-
-            while let Some((Ok(token), _)) = code.next() {
-                if let Token::Property(property) = token {
-                    match property.as_str() {
+            while let Some((_, token)) = iter.next() {
+                match token {
+                    Token::Property(name) => match name.as_str() {
                         "IJK" => {
                             if let (
-                                Some((Ok(Token::Equal), _)),
-                                Some((Ok(Token::Number(i)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(j)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(k)), _)),
+                                Some(_), // Equal
+                                Some((_, Token::Number(i))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(j))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(k))),
                             ) = (
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
                             ) {
                                 cells_x = *i;
                                 cells_y = *j;
@@ -142,31 +126,31 @@ fn cell_size_lens(script: &Script, code_lenses: &mut Vec<CodeLens>){
                         }
                         "XB" => {
                             if let (
-                                Some((Ok(Token::Equal), _)),
-                                Some((Ok(Token::Number(x1)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(x2)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(y1)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(y2)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(z1)), _)),
-                                Some((Ok(Token::Comma), _)),
-                                Some((Ok(Token::Number(z2)), _)),
+                                Some(_), // Equal
+                                Some((_, Token::Number(x1))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(x2))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(y1))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(y2))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(z1))),
+                                Some(_), // Comma
+                                Some((_, Token::Number(z2))),
                             ) = (
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
-                                &code.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
+                                iter.next(),
                             ) {
                                 size_x = x2 - x1;
                                 size_y = y2 - y1;
@@ -174,11 +158,13 @@ fn cell_size_lens(script: &Script, code_lenses: &mut Vec<CodeLens>){
                             }
                         }
                         _ => {}
-                    }
-                };
+                    },
+                    Token::End => break,
+                    _ => {}
+                }
             }
-        
-            if size_x > 0.0 && size_y > 0.0 && size_z > 0.0{
+
+            if size_x > 0.0 && size_y > 0.0 && size_z > 0.0 {
                 let cells = cells_x * cells_y * cells_z;
                 let cell_size_x = size_x / cells_x;
                 let cell_size_y = size_y / cells_y;
@@ -203,29 +189,27 @@ fn cell_size_lens(script: &Script, code_lenses: &mut Vec<CodeLens>){
                     data: None,
                 });
 
-
-
                 total_cells += cells;
             }
-        });
+        }
+    }
 
-        code_lenses.push(CodeLens {
-            range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: 0,
-                },
+    code_lenses.push(CodeLens {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
             },
-            command: Some(Command {
-                title: format!("Total Cells: {total_cells}",),
-                command: String::default(),
-                arguments: None,
-            }),
-            data: None,
-        });
-
+            end: Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        command: Some(Command {
+            title: format!("Total Cells {total_cells}"),
+            command: String::default(),
+            arguments: None,
+        }),
+        data: None,
+    });
 }

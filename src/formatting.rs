@@ -1,12 +1,7 @@
 //! Add formatting support
 
-use crate::Backend;
+use crate::{parser::Token, Backend};
 
-use chumsky::{
-    error::Cheap,
-    text::{ident, TextParser},
-    Parser,
-};
 use std::fmt::Display;
 use tower_lsp::{
     jsonrpc::{Error, Result},
@@ -61,71 +56,81 @@ pub async fn formatting(
     };
     let script = script.value();
 
-    let text_edits = script
-        .iter()
-        .rev()
-        .filter_map(|(block, range)| match block {
-            crate::parser::Block::Comment => None,
-            crate::parser::Block::Code(code) => Some((code, range)),
-            crate::parser::Block::ParseError(_) => None,
-        })
-        .filter_map(|(code, range)| {
-            let mut text = vec![];
-            for (res, range) in code {
-                let token = match res {
-                    Ok(ok) => ok,
-                    Err(_) => return None,
-                };
-
+    let mut text_edits = vec![];
+    let mut iter = script.iter().map(|f| (f.span.lsp_span, &f.token));
+    while let Some((start, token)) = iter.next() {
+        if &Token::Start == token {
+            let mut tokens = vec![];
+            if let Some((_, Token::Class(name))) = iter.next() {
+                tokens.push(format!("&{name} "))
+            } else {
+                continue;
+            }
+            for (end, token) in iter.by_ref() {
                 match token {
-                    crate::parser::Token::Start => {}
-                    crate::parser::Token::Class(class) => text.push(format!("&{class} ")),
-                    crate::parser::Token::Property(property) => text.push(format!("{property} = ")),
-                    crate::parser::Token::Number(_) => {
+                    Token::Start | Token::Class(_) | Token::Error | Token::Comment => break,
+                    Token::Comma | Token::Equal => continue,
+                    Token::Property(name) => tokens.push(format!("{name} = ")),
+                    Token::Number(_) => {
                         //HACK To support numbers like 12E12 they have to be cut from the raw document
-                        let start = rope.line_to_char(range.start.line as usize)
-                            + range.start.character as usize;
-                        let end = rope.line_to_char(range.end.line as usize)
-                            + range.end.character as usize;
+                        let start = rope.line_to_char(end.start.line as usize)
+                            + end.start.character as usize;
+                        let end =
+                            rope.line_to_char(end.end.line as usize) + end.end.character as usize;
                         let n = rope.slice(start..end).to_string();
-                        text.push(format!("{n}, "))
+                        tokens.push(format!("{n}, "))
                     }
-                    crate::parser::Token::Boolean(b) => {
-                        if *b {
-                            text.push(".TRUE., ".to_string())
+                    Token::Boolean(b) => match b {
+                        true => tokens.push(".TRUE., ".to_string()),
+                        false => tokens.push(".FALSE., ".to_string()),
+                    },
+                    Token::String(text) => tokens.push(format!("\"{text}\", ")),
+                    Token::Variable(text) => tokens.push(format!("#{text}#, ")),
+                    Token::End => {
+                        tokens.push("/".to_string());
+                        let new_text = if tokens.iter().map(|f| f.len()).sum::<usize>() > 100 {
+                            let mut property_length = 0;
+                            tokens
+                                .into_iter()
+                                .map(|f| {
+                                    if f.starts_with('&') {
+                                        f
+                                    } else if f.chars().take(1).any(|f| f.is_ascii_alphabetic()) {
+                                        let text = format!("\n\t{f}");
+                                        property_length = text.len();
+                                        text
+                                    } else if f.starts_with('/') {
+                                        "\n/".to_string()
+                                    } else if property_length + f.len() > 100 {
+                                        let text = format!("\n\t\t{f}");
+                                        property_length = text.len();
+                                        text
+                                    } else {
+                                        property_length += f.len();
+                                        f
+                                    }
+                                })
+                                .collect()
                         } else {
-                            text.push(".FALSE., ".to_string())
-                        }
+                            tokens.join("")
+                        };
+
+                        let text_edit = TextEdit {
+                            range: tower_lsp::lsp_types::Range {
+                                start: start.start,
+                                end: end.end,
+                            },
+                            new_text,
+                        };
+                        text_edits.push(text_edit);
+                        break;
                     }
-                    crate::parser::Token::String(s) => text.push(format!("\"{s}\", ")),
-                    crate::parser::Token::Comma => {}
-                    crate::parser::Token::Equal => {}
-                    crate::parser::Token::End => text.push("/\n".to_string()),
                 }
             }
-
-            let len = text.iter().map(|f| f.len()).sum::<usize>();
-            let new_text = if len > 80 {
-                text.into_iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        if i > 2 && ident::<_, Cheap<char>>().padded().parse(&s as &str).is_ok() {
-                            format!("\n      {}", s)
-                        } else {
-                            s
-                        }
-                    })
-                    .collect::<String>()
-            } else {
-                text.into_iter().collect::<String>()
-            };
-
-            Some(TextEdit {
-                range: *range,
-                new_text,
-            })
-        })
-        .collect::<Vec<_>>();
+        }
+    }
+    // Reverse so the edits are executed from end to start so there are no conflicts in the edited range.
+    text_edits.reverse();
 
     Ok(Some(text_edits))
 }

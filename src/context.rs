@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Range};
 
 use crate::{
     completion::CompletionItemValue,
-    parser::{Script, Token},
+    parser::{ScriptData, Token},
 };
 
 /// A item that can be referenced.
@@ -64,47 +64,36 @@ impl DerefMut for ContextMap {
 }
 
 /// Get the [`ContextMap`] from the script.
-pub fn get_context(script: &Script) -> ContextMap {
+pub fn get_context(script: &ScriptData) -> ContextMap {
     let mut content_map = ContextMap::default();
 
-    script
-        .iter()
-        .filter_map(|(block, _)| {
-            if let crate::parser::Block::Code(code) = block {
-                Some(code)
-            } else {
-                None
-            }
-        })
-        .for_each(|code| {
-            let mut code = code.iter();
+    let mut iter = script.iter().map(|f| (f.span.lsp_span, &f.token));
 
-            code.next();
-            let Some((Ok(Token::Class(class)), _)) = code.next() else {
-                return;
-            };
-
-            while let Some((Ok(token), _)) = code.next() {
-                if let Token::Property(prop) = token {
-                    if prop == "ID" {
-                        code.next();
-                        if let Some((Ok(Token::String(id)), range)) = code.next() {
-                            let context = match content_map.get_mut(class) {
-                                Some(some) => some,
-                                None => {
-                                    let vec = vec![];
-                                    content_map.insert(class.clone(), vec);
-                                    content_map.get_mut(class).expect("error not possible since a vector is inserted right before")
-                                }
+    while let Some((_, token)) = iter.next() {
+        if let Token::Class(class_name) = token {
+            while let Some((_, token)) = iter.next() {
+                match token {
+                    Token::Property(property_name) => {
+                        if property_name == "ID" {
+                            iter.next(); // Equal
+                            let Some((range,Token::String(name))) = iter.next() else {continue;};
+                            let context = Context {
+                                name: name.clone(),
+                                range,
                             };
-                            context.push(Context { name: id.clone(), range: *range });
-                            return;
+                            if let Some(vec) = content_map.get_mut(class_name) {
+                                vec.push(context);
+                            } else {
+                                content_map.insert(class_name.clone(), vec![context]);
+                            }
                         }
-                        return;
                     }
+                    Token::End => break,
+                    _ => {}
                 }
             }
-        });
+        }
+    }
 
     content_map
 }
