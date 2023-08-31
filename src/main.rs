@@ -11,19 +11,19 @@ mod completion;
 mod context;
 mod fds_classes;
 mod fds_defaults;
+mod formatting;
+mod hover;
 mod parser;
 mod semantic_token;
 mod versions;
-mod formatting;
 
 use completion::{get_completion_response, set_completion_response};
-use context::ContextMap;
+use context::{get_context, ContextMap};
 use dashmap::DashMap;
 use fds_classes::FDSClasses;
 use fds_defaults::FDSDefaults;
-use parser::{Block, Script, Token};
+use parser::{ScriptData, Token};
 use ropey::{self, Rope};
-use semantic_token::convert_script_to_sematic_tokens;
 use std::fmt::Display;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -44,7 +44,7 @@ pub struct Backend {
     pub document_map: DashMap<String, Rope>,
 
     /// All document converted to tokens.
-    pub script_map: DashMap<String, Script>,
+    pub script_map: DashMap<String, ScriptData>,
     /// All custom ids inside a document.
     pub context_map: DashMap<String, ContextMap>,
 
@@ -87,14 +87,19 @@ impl Backend {
         let uri = params.uri.to_string();
         self.document_map.insert(uri.clone(), rope.clone());
 
-        let script = Script::new(&rope);
+        let script = match ScriptData::try_from_rope(&rope) {
+            Ok(ok) => ok,
+            Err(_) => {
+                self.error("Unable to load script data from file").await;
+                return;
+            }
+        };
 
-        self.context_map
-            .insert(uri.clone(), context::get_context(&script));
+        let context_map = get_context(&script);
+        self.context_map.insert(uri.clone(), context_map);
         self.script_map.insert(uri.clone(), script);
 
         //FIXME recovery if line count = 0
-        //TODO message, when no version was found
         // Get the version of the current document. If no version was explicitly set, a default version is used. If the set Version could not befound, a less desting version is used (e.g. 6.1.4 -> 6). If no directory could be found either the fallback version is used too.
         match versions::get_version(rope.line(0).to_string()) {
             Ok((version, path_buf)) => {
@@ -129,7 +134,8 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         // Log all environment variables
-        self.log(format! {"{:?}", std::env::args()}).await;
+        self.log(format! {"Arguments: {:?}", std::env::args()})
+            .await;
 
         // Set all available services and their settings
         Ok(InitializeResult {
@@ -225,84 +231,17 @@ impl LanguageServer for Backend {
         })
         .await;
 
-        //TODO Move to on change function and the block to semantic tokens
+        // Diagnostics
         if let Some(script) = self.script_map.get(&uri.to_string()) {
             let script = script.value();
-
-            let mut diagnostics = vec![];
-            let list = script
+            //let mut diagnostics = vec![];
+            let diagnostics = script
                 .iter()
-                .filter_map(|(block, _)| match block {
-                    Block::Code(value) => Some(value),
-                    _ => None,
+                .filter_map(|f| f.info.as_ref().map(|some| (&f.span.lsp_span, some)))
+                .flat_map(|(range, info)| {
+                    info.iter().map(|token_info| token_info.diagnostic(*range))
                 })
                 .collect::<Vec<_>>();
-
-            if let Some(first) = list.first() {
-                if let Some((Ok(Token::Class(class)), range)) = first.get(1) {
-                    if class != "HEAD" {
-                        diagnostics.push(Diagnostic {
-                            range: *range,
-                            message: "`&HEAD /` should be at the start.".to_string(),
-                            ..Default::default()
-                        });
-                    }
-                }
-            } else {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                    },
-                    message: "`&HEAD /` is missing".to_string(),
-                    ..Default::default()
-                });
-            }
-
-            if let Some(last) = list.last() {
-                if let Some((Ok(Token::Class(class)), range)) = last.get(1) {
-                    if class != "TAIL" {
-                        diagnostics.push(Diagnostic {
-                            range: *range,
-                            message: "`&TAIL /` should be at the end.".to_string(),
-                            ..Default::default()
-                        });
-                    }
-                }
-            } else {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                    },
-                    message: "`&TAIL /` is missing".to_string(),
-                    ..Default::default()
-                });
-            }
-
-            list.iter()
-                .flat_map(|f| {
-                    f.iter()
-                        .filter_map(|(token, range)| match token {
-                            Ok(_) => None,
-                            Err(value) => Some((value, range)),
-                        })
-                        .map(|(token, range)| token.get_diagnostic(*range))
-                })
-                .for_each(|f| diagnostics.push(f));
-
             self.client
                 .publish_diagnostics(uri, diagnostics, None)
                 .await;
@@ -310,6 +249,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.log("Close document.").await;
         let uri = params.text_document.uri.to_string();
         self.document_map.remove(&uri);
         self.script_map.remove(&uri);
@@ -335,9 +275,8 @@ impl LanguageServer for Backend {
         let result = match self.script_map.get(&uri.to_string()) {
             Some(script) => {
                 // Load the code highlight for the script.
-                let tokens = convert_script_to_sematic_tokens(script.value());
                 let tokens = SemanticTokens {
-                    data: tokens,
+                    data: script.value().semantic_tokens(),
                     result_id: None,
                 };
                 Some(SemanticTokensResult::Tokens(tokens))
@@ -349,50 +288,7 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-
-        //TODO move to own file
-        let hover = || -> Option<Hover> {
-            let script = self.script_map.get(&uri.to_string())?;
-            let pos = params.text_document_position_params.position;
-            let script = script.value();
-            let block = script.get_block(pos)?;
-            let (token, range) = &block._get_token(pos)?;
-            let token = match token {
-                Ok(value) => Some(value),
-                _ => None,
-            }?;
-
-            let version = self.versions_map.get(&uri.to_string())?;
-            let version = version.value();
-            let fds_classes = self.fds_classes_map.get(version)?;
-            let fds_classes = fds_classes.value();
-
-            let markdown = match token {
-                Token::Class(value) => {
-                    let class = fds_classes.get(value)?;
-                    Some(class.to_markdown_string())
-                }
-                Token::Property(value) => {
-                    let class_name = block.get_name()?;
-                    let class = fds_classes.get(&class_name)?;
-                    let property = class.properties.get(value)?;
-                    Some(property.to_markdown_string())
-                }
-                _ => None,
-            }?;
-
-            let hover = Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: markdown,
-                }),
-                range: Some(*range),
-            };
-
-            Some(hover)
-        }();
-        Ok(hover)
+        hover::hover(self, params).await
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {

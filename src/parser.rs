@@ -1,157 +1,30 @@
-//! Parse the text to representing types
+//! Parse the document to tokens
 
-use anyhow::Result;
-use chumsky::{error::Cheap, prelude::*, Error, Stream};
+use std::{error::Error, fmt::Display, ops::Deref};
+
+use chumsky::{error::Cheap, Parser};
 use ropey::Rope;
-use std::ops::Range;
-use tower_lsp::lsp_types::{Diagnostic, Position};
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, Position, Range as LspSpan, SemanticToken,
+};
 
-use self::parse_helper::script_parser;
+use crate::semantic_token::SemanticTokenTypeIndex;
+/// Alias for [`Range<usize>`] for easier type recognition
+type RopeSpan = std::ops::Range<usize>;
 
-/// Private representation of a chunk of the script. It is either a comment or code. the range is the total range
-#[derive(Debug, PartialEq, Clone)]
-enum RopeBlock {
-    /// Any comment. Every line that does not start with a `&` or after a `/` until code starts.
-    Comment,
-    /// Everything inside `&` and `/` including the tokens
-    Code(Vec<(Result<Token, TokenError>, Range<usize>)>),
-}
-impl RopeBlock {
-    /// Converts the [`ScriptBlock`] to [`Block`]
-    fn convert_to_block(self, rope: &Rope) -> Block {
-        match self {
-            RopeBlock::Comment => Block::Comment,
-            RopeBlock::Code(code) => Block::Code(
-                code.into_iter()
-                    .map(|(script_block, span)| (script_block, convert_span(span, rope)))
-                    .collect::<Vec<_>>(),
-            ),
-        }
-    }
-}
-
-/// Representation of a chunk of the script. It is either a comment, code or an error due to parsing.
-#[derive(Debug, PartialEq, Clone)]
-pub enum Block {
-    /// Any comment. Every line that does not start with a `&` or after a `/` until code starts.
-    Comment,
-    /// Everything inside `&` and `/` including the tokens
-    Code(Vec<(Result<Token, TokenError>, tower_lsp::lsp_types::Range)>),
-    /// The error that occurred due to parsing
-    ParseError(Option<String>),
-}
-impl Block {
-    /// Get tht token at a given posion. If the block is an comment or an parse error then [`None`] is returned.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if the underling code block has an error.
-    pub fn _get_token(
-        &self,
-        pos: Position,
-    ) -> Option<(Result<Token, TokenError>, tower_lsp::lsp_types::Range)> {
-        match self {
-            Block::Comment => None,
-            Block::Code(code) => {
-                for (token, range) in code.iter() {
-                    if range.start <= pos && range.end >= pos {
-                        return Some((token.clone(), *range));
-                    }
-                }
-                None
-            }
-            Block::ParseError(_) => None,
-        }
-    }
-
-    /// Get the class name of the block. Only returns [`Some`] if the block is code.
-    pub fn get_name(&self) -> Option<String> {
-        if let Block::Code(code) = self {
-            if code.len() >= 2 {
-                let (token, _) = &code[1];
-                if let Ok(Token::Class(name)) = token {
-                    return Some(name.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Checks if the code block has a specific class.
-    pub fn is_class(&self, name: &str) -> bool {
-        let Some(get_name) = self.get_name() else { return false};
-        get_name == name
-    }
-
-    /// Geht the property name at a given position iside a block, Only returns [`Some`] if the block is code.
-    pub fn get_recent_property(
-        &self,
-        pos: Position,
-    ) -> Option<(String, tower_lsp::lsp_types::Range)> {
-        let Block::Code( code) =self else { return None};
-        code.iter()
-            .filter_map(|(token, span)| match token {
-                Ok(Token::Property(property)) => Some((property, span)),
-                _ => None,
-            })
-            .rev()
-            .find_map(|(property, range)| {
-                if range.start <= pos {
-                    Some((property.clone(), *range))
-                } else {
-                    None
-                }
-            })
-    }
-}
-
-/// The whole script, a collection of blocks.
+/// Wrapper for an error that may occur if the parsing was implemented incorrectly.
 #[derive(Debug)]
-pub struct Script(Vec<(Block, tower_lsp::lsp_types::Range)>);
-impl Script {
-    /// Create the [`Script`] from a file.
-    pub fn new(rope: &Rope) -> Self {
-        let content = match parse(rope.to_string()) {
-            Ok(ok) => ok
-                .into_iter()
-                .map(|(script_block, span)| {
-                    (
-                        script_block.convert_to_block(rope),
-                        convert_span(span, rope),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            Err(err) => err
-                .into_iter()
-                .map(|f| {
-                    (Block::ParseError(f.label().map(|some| some.to_string())), {
-                        convert_span(f.span(), rope)
-                    })
-                })
-                .collect::<Vec<_>>(),
-        };
+pub struct ScriptParseError(Vec<Cheap<char>>);
 
-        Self(content)
-    }
-
-    /// Get the code block at a position. Only returns [`Some`] if the position is inside the range.
-    pub fn get_block(&self, pos: Position) -> Option<Block> {
-        for (block, range) in self.0.iter() {
-            if range.start <= pos && range.end >= pos {
-                return Some(block.clone());
-            }
-        }
-        None
-    }
-
-    /// Get the iter from the inner value.
-    pub fn iter(&self) -> std::slice::Iter<(Block, tower_lsp::lsp_types::Range)> {
-        self.0.iter()
+impl Display for ScriptParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to parse text. {:?}", self.0)
     }
 }
+impl Error for ScriptParseError {}
 
-/// All relevant tokens a block is composed of.
-#[derive(Debug, PartialEq, Clone)]
+/// All possible Tokens the text can consist of.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     /// The start token represented by `&`
     Start,
@@ -165,88 +38,349 @@ pub enum Token {
     Boolean(bool),
     /// The string token, delimitered by `"` or `'`
     String(String),
+    /// The Variable token, represented by text padded with #
+    Variable(String),
     /// The comma token represented by `,`
     Comma,
     /// The equal token represented by `=`
     Equal,
     /// The end token represented by `/`
     End,
+    /// Empty token wich should always be pared with at least on TokenInfo
+    Error,
+    /// Text that is marked as Comment and should be ignored in the most cases.
+    Comment,
 }
 
-/// All possible errors that can be found inside the use input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenError {
-    /// After the class token the class is missing.
-    Class,
-    /// When a property is expected but none was found.
-    Property,
-    /// When the property was defined, but no assignment is happening.
-    PropertyAssignment,
-    /// The value of a property has an unknown type
-    PropertyValue,
-    /// The end char is missing
-    End,
+/// Container for the rope span, which is the total char position for start and end, and lsp span, which is consist of line and char for start and end.
+#[derive(Debug, Clone)]
+pub struct Span {
+    /// Span which is the total char position for start and end.
+    pub rope_span: RopeSpan,
+    /// Span which is consist of line and char for start and end.
+    pub lsp_span: LspSpan,
 }
-impl TokenError {
-    /// Converts a [`TokenError`] to a [`Diagnostic`]
-    pub fn get_diagnostic(&self, range: tower_lsp::lsp_types::Range) -> Diagnostic {
-        let message = match self {
-            TokenError::Class => "Immediately after a '&' a class is expected.",
-            TokenError::Property => "A property is expected.",
-            TokenError::PropertyAssignment => "The property was assigned wrong.",
-            TokenError::PropertyValue => "Unknown value type",
-            TokenError::End => "An end char could not be found. Did you forgot a '/'?",
+
+/// All additional data that a token can have.
+#[derive(Debug)]
+pub struct TokenData {
+    /// The token itself.
+    pub token: Token,
+    /// The position of the token.
+    pub span: Span,
+    /// Some information about the token, like hints, warnings and errors.
+    pub info: Option<Vec<TokenInfo>>,
+}
+
+/// Continer for all tokens inside a file.
+#[derive(Debug)]
+pub struct ScriptData(Vec<TokenData>);
+impl Deref for ScriptData {
+    type Target = Vec<TokenData>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl ScriptData {
+    /// Convert text from a file in [`ScriptData`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the text could not be parsed in to tokens.
+    pub fn try_from_rope(rope: &Rope) -> Result<ScriptData, ScriptParseError> {
+        let result = match parse_helper::script_parser().parse(rope.to_string()) {
+            Ok(ok) => ok,
+            Err(err) => return Err(ScriptParseError(err)),
+        };
+
+        let mut data = result
+            .into_iter()
+            .map(|(token, rope_span, info)| {
+                let start = {
+                    let pos = rope_span.start;
+                    let l = rope.char_to_line(pos);
+                    let c = pos - rope.line_to_char(l);
+
+                    Position::new(l as u32, c as u32)
+                };
+                let end = {
+                    let pos = rope_span.end;
+                    let l = rope.char_to_line(pos);
+                    let c = pos - rope.line_to_char(l);
+
+                    Position::new(l as u32, c as u32)
+                };
+
+                let lsp_span = tower_lsp::lsp_types::Range::new(start, end);
+
+                TokenData {
+                    token,
+                    span: Span {
+                        rope_span,
+                        lsp_span,
+                    },
+                    info,
+                }
+            })
+            .collect::<Vec<TokenData>>();
+
+        {
+            let mut iter = data
+                .iter_mut()
+                .filter(|f| matches!(f.token, Token::Class(_)));
+
+            // Check if Head is the first class
+            if let Some(token_data) = iter.next() {
+                if Token::Class("HEAD".to_string()) != token_data.token {
+                    match token_data.info.as_mut() {
+                        Some(vec) => vec.insert(0, TokenInfo::WarnHeadMissing),
+                        None => token_data.info = Some(vec![TokenInfo::WarnHeadMissing]),
+                    }
+                }
+            }
+            // Check if TAIL is the last class
+            if let Some(token_data) = iter.last() {
+                if Token::Class("TAIL".to_string()) != token_data.token {
+                    match token_data.info.as_mut() {
+                        Some(vec) => vec.insert(0, TokenInfo::WarnTailMissing),
+                        None => token_data.info = Some(vec![TokenInfo::WarnTailMissing]),
+                    }
+                }
+            }
         }
-        .to_string();
 
-        Diagnostic {
-            range,
-            message,
-            ..Default::default()
+        Ok(ScriptData(data))
+    }
+
+    /// Determind the [`SemanticToken`] inside this [`ScriptData`], with the relative positions.
+    pub fn semantic_tokens(&self) -> Vec<SemanticToken> {
+        let mut last_line = 0;
+        let mut last_character = 0;
+        let mut last_length = 0;
+
+        /// Helper function to convert [`tower_lsp::lsp_types::Range`] to `delta_line`, `delta_start` and `length`.
+        fn values_from_range(
+            last_line: &mut u32,
+            last_character: &mut u32,
+            last_length: &mut u32,
+            range: tower_lsp::lsp_types::Range,
+        ) -> (u32, u32, u32) {
+            let Position {
+                line: start_line,
+                character: start_character,
+            } = range.start;
+            let Position {
+                character: end_character,
+                ..
+            } = range.end;
+
+            let (delta_line, delta_start) = if start_line == *last_line {
+                (0, start_character - *last_character + *last_length)
+            } else {
+                (start_line - *last_line, start_character)
+            };
+
+            let length = end_character.saturating_sub(start_character);
+
+            *last_line = start_line;
+            *last_character = end_character;
+            *last_length = length;
+
+            (delta_line, delta_start, length)
+        }
+
+        self.iter()
+            .filter_map(|f| {
+                let token_type = match f.token {
+                    crate::parser::Token::Start => SemanticTokenTypeIndex::Start,
+                    crate::parser::Token::Class(_) => SemanticTokenTypeIndex::Class,
+                    crate::parser::Token::Property(_) => SemanticTokenTypeIndex::Property,
+                    crate::parser::Token::Number(_) => SemanticTokenTypeIndex::Number,
+                    crate::parser::Token::Boolean(_) => SemanticTokenTypeIndex::Bool,
+                    crate::parser::Token::String(_) => SemanticTokenTypeIndex::String,
+                    crate::parser::Token::Variable(_) => SemanticTokenTypeIndex::Variable,
+                    crate::parser::Token::Comma => return None,
+                    crate::parser::Token::Equal => return None,
+                    crate::parser::Token::End => SemanticTokenTypeIndex::End,
+                    crate::parser::Token::Error => return None,
+                    crate::parser::Token::Comment => SemanticTokenTypeIndex::Comment,
+                }
+                .value();
+                let range = f.span.lsp_span;
+                Some((range, token_type))
+            })
+            .map(|(range, token_type)| {
+                let (delta_line, delta_start, length) =
+                    values_from_range(&mut last_line, &mut last_character, &mut last_length, range);
+
+                SemanticToken {
+                    delta_line,
+                    delta_start,
+                    length,
+                    token_type,
+                    token_modifiers_bitset: 0,
+                }
+            })
+            .collect()
+    }
+}
+
+/// All possible hints, infos, warnings and errors this language server can find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenInfo {
+    /// When a string is padded in single qoutes instead of double qoutes.
+    HintUseDoubleQuotes,
+    /// When a float number ends with a dot e.g. 1.
+    HintFloatNumber,
+    /// When T and F are used as booleans instead of .TRUE. and .FALSE.
+    HintUseVerboseBoolean,
+    /// When after the property assignment a comma is missing.
+    HintComma,
+    /// When the first namespace is not &HEAD.
+    WarnHeadMissing,
+    /// When the last namespace is not &TAIL.
+    WarnTailMissing,
+    /// When the class name does not consist of 4 chars.
+    WarnClassNameLength,
+    /// When the class name consist of some lower case letters.
+    WarnClassSomeLowercase,
+    /// When the property name consist of some lower case letters.
+    WarnPropertySomeLowercase,
+    /// When the class name is missing.
+    ErrorClassNameMissing,
+    /// When the property was defined, but no assignment is happening.
+    ErrorPropertyAssignmentMissing,
+    /// The value of a property has an unknown type.
+    ErrorUnknownPropertyValue,
+    /// The end char is missing
+    ErrorEndCharMissing,
+}
+impl TokenInfo {
+    /// Determine the diagnostig for [`TokenInfo`]
+    pub fn diagnostic(&self, range: tower_lsp::lsp_types::Range) -> Diagnostic {
+        match self {
+            TokenInfo::HintUseDoubleQuotes => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::HINT),
+                message: "It is recommended to use double quotes to define a string.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::HintFloatNumber => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::HINT),
+                message: "It is recommended to add at least one number after a dot to define a float value.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::HintUseVerboseBoolean => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::HINT),
+                message: "It is recommended to use verbose booleans `.TRUE.` and `.FALSE.`.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::HintComma => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::HINT),
+                message: "It is recommended to the property assignment with a comma.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::WarnHeadMissing => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: "First namespace should be `&HEAD`.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::WarnTailMissing => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: "Last namespace should be `&TAIL`.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::WarnClassNameLength => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: "Namespace does not consist of four letters, therefor might not be valide.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::WarnClassSomeLowercase => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: "Namespace consist of some lowercase letters, therefor might not be valide.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::WarnPropertySomeLowercase => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: "Property consist of some lowercase letters, therefor might not be valide.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::ErrorClassNameMissing => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Namespace is missing.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::ErrorPropertyAssignmentMissing => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Property assignment is missing.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::ErrorUnknownPropertyValue => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "Property has an unknown value and could not be parsed.".to_string(),
+                ..Default::default()
+            },
+            TokenInfo::ErrorEndCharMissing => Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: "End char `/` is missing.".to_string(),
+                ..Default::default()
+            },
         }
     }
 }
 
-#[allow(clippy::type_complexity)]
-/// Parses the script to a [`ScriptBlock`]
-fn parse<'a, Iter, S>(stream: S) -> Result<Vec<(RopeBlock, Range<usize>)>, Vec<Cheap<char>>>
-where
-    Iter: Iterator<Item = (char, Range<usize>)> + 'a,
-    S: Into<Stream<'a, char, Range<usize>, Iter>>,
-{
-    script_parser().parse(stream)
-}
-
-/// Convert a absolute text position to a `lsp_types` [`Position`]
-fn convert_position(pos: usize, rope: &Rope) -> Position {
-    let l = rope.char_to_line(pos);
-    let c = pos - rope.line_to_char(l);
-
-    Position::new(l as u32, c as u32)
-}
-
-/// Converts a `chumsky` text span to a `lsp_types` range
-fn convert_span(span: Range<usize>, rope: &Rope) -> tower_lsp::lsp_types::Range {
-    tower_lsp::lsp_types::Range::new(
-        convert_position(span.start, rope),
-        convert_position(span.end, rope),
-    )
-}
-
 mod parse_helper {
-    //! Private module to separate the token parser.
+    //! Helper module with the hard of the parser.
+    #![allow(unused)]
+    #![allow(missing_docs)]
+    use chumsky::{chain::Chain, error::Cheap, prelude::*, text::whitespace};
 
-    #![allow(private_in_public)]
+    /// Alias for [`Range<usize>`] for easier type recognition
+    type RopeSpan = std::ops::Range<usize>;
 
-    use std::ops::Range;
+    use super::{Span, Token, TokenInfo};
 
-    use super::{RopeBlock, Token, TokenError};
-    use chumsky::{error::Cheap, prelude::*, text::whitespace, Error};
-
-    /// Parser for a class name after the start token.
+    /// Parser for a class name with the start token.
     #[inline]
-    fn class_parser() -> impl Parser<char, String, Error = Cheap<char>> {
-        filter(char::is_ascii_alphabetic).repeated().collect()
+    fn class_parser(
+    ) -> impl Parser<char, Vec<(Token, RopeSpan, Option<Vec<TokenInfo>>)>, Error = Cheap<char>>
+    {
+        let start = whitespace()
+            .then(just('&').map_with_span(|_, span| (Token::Start, span, None)))
+            .map(|(_, s)| s);
+        let class = filter(char::is_ascii_alphabetic)
+            .repeated()
+            .collect()
+            .map_with_span(|text: String, span| {
+                let vec = if text.len() == 4 {
+                    if text.chars().any(|c| c.is_lowercase()) {
+                        Some(vec![TokenInfo::WarnClassSomeLowercase])
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(vec![if text.is_empty() {
+                        TokenInfo::ErrorClassNameMissing
+                    } else {
+                        TokenInfo::WarnClassNameLength
+                    }])
+                };
+                (Token::Class(text), span, vec)
+            });
+        start.chain(class)
     }
 
     /// Parse a number
@@ -260,7 +394,8 @@ mod parse_helper {
     /// - `12e45`
     /// - `12E-5`
     #[inline]
-    fn number_parser() -> impl Parser<char, String, Error = Cheap<char>> {
+    fn number_parser(
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
         just('-')
             .or_not()
             .chain::<char, _, _>(
@@ -282,7 +417,15 @@ mod parse_helper {
                             .flatten(),
                     ),
             )
-            .collect()
+            .map_with_span(|text: Vec<char>, span: RopeSpan| {
+                let mut info = None;
+                let text = text.into_iter().collect::<String>();
+                if text.ends_with('.') {
+                    info = Some(vec![TokenInfo::HintFloatNumber])
+                }
+                let number = text.parse::<f32>().unwrap();
+                (Token::Number(number), span, info)
+            })
     }
 
     /// Parse a boolean
@@ -293,12 +436,29 @@ mod parse_helper {
     /// - `.TRUE.`
     /// - `.FALSE.`
     #[inline]
-    fn bool_parser() -> impl Parser<char, String, Error = Cheap<char>> {
+    fn boolean_parser(
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
         just("T")
             .or(just("F"))
             .or(just(".TRUE."))
             .or(just(".FALSE."))
-            .map(|s| s.to_string())
+            .map_with_span(|text, span| {
+                let mut info = None;
+                let boolean = match text {
+                    "T" => {
+                        info = Some(vec![TokenInfo::HintUseVerboseBoolean]);
+                        true
+                    }
+                    "F" => {
+                        info = Some(vec![TokenInfo::HintUseVerboseBoolean]);
+                        false
+                    }
+                    ".TRUE." => true,
+                    _ => false,
+                };
+
+                (Token::Boolean(boolean), span, info)
+            })
     }
 
     /// Parse a string
@@ -307,7 +467,8 @@ mod parse_helper {
     /// - `""`
     /// - `''`
     #[inline]
-    fn string_parser() -> impl Parser<char, String, Error = Cheap<char>> {
+    fn string_parser(
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
         let single_quote = take_until(
             none_of('\\')
                 .then(just('\'').ignored().rewind())
@@ -318,7 +479,8 @@ mod parse_helper {
             s
         })
         .padded_by(just('\''))
-        .collect::<String>();
+        .collect::<String>()
+        .map(|s| ('\'', s));
 
         let double_quote = take_until(
             none_of('\\')
@@ -330,37 +492,58 @@ mod parse_helper {
             s
         })
         .padded_by(just('"'))
-        .collect::<String>();
+        .collect::<String>()
+        .map(|s| ('\"', s));
 
         just("''")
-            .or(just("\"\""))
-            .to("".to_string())
+            .to('\'')
+            .or(just("\"\"").to('"'))
+            .map(|c| (c, "".to_string()))
             .or(single_quote)
             .or(double_quote)
+            .map_with_span(|(c, text): (char, String), span: RopeSpan| {
+                let mut info = None;
+                if c == '\'' {
+                    info = Some(vec![TokenInfo::HintUseDoubleQuotes])
+                }
+                (Token::String(text), span, info)
+            })
     }
 
-    /// Parse a name
+    /// Parse a variable
     ///
-    /// Supported
-    /// - `NAME`
-    /// - `NAME(3)`
-    /// - `NAME(3:3)`
-    /// - `NAME(3,3)`
-    //MAYBE Split Property content
+    /// Supported:
+    /// - `#TEXT#`
     #[inline]
-    fn property_parser() -> impl Parser<char, String, Error = Cheap<char>> {
-        let content = filter(char::is_ascii_digit)
-            .repeated()
-            .at_least(1)
-            .chain(just(':').or(just(',')).or_not())
-            .repeated()
-            .at_least(1)
-            .flatten();
+    fn variable_parser(
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
+        take_until(
+            none_of('#')
+                .then(just('#').ignored().rewind())
+                .map(|(c, _)| c),
+        )
+        .map(|(mut s, c)| {
+            s.push(c);
+            s
+        })
+        .padded_by(just('#'))
+        .collect::<String>()
+        .map_with_span(|text, span: RopeSpan| (Token::Variable(text), span, None))
+    }
 
-        filter(char::is_ascii_alphabetic)
-            .chain(filter(|c| char::is_ascii_alphanumeric(c) || *c == '_').repeated())
-            .chain::<char, _, _>(just('(').chain(content).chain(just(')')).or_not().flatten())
-            .collect()
+    /// Parse the end, if it is an error.
+    #[inline]
+    fn end_error_parser(
+        err: &'static TokenInfo,
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
+        take_until(
+            just('/')
+                .ignored()
+                .rewind()
+                .or(just('&').ignored().rewind())
+                .or(end()),
+        )
+        .map_with_span(|_, span| (Token::Error, span, Some(vec![*err])))
     }
 
     /// Parse one value of a property
@@ -371,526 +554,515 @@ mod parse_helper {
     /// - string
     #[inline]
     fn property_value_parser(
-    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, Range<usize>)>, Error = Cheap<char>>
-    {
-        let number_parser = number_parser()
-            .map_with_span(|s, span| vec![(Ok(Token::Number(s.parse().unwrap())), span)]);
-        let boolean_parser = bool_parser().map_with_span(|s, span| {
-            vec![(
-                Ok(Token::Boolean(match s.as_str() {
-                    "T" => true,
-                    "F" => false,
-                    ".TRUE." => true,
-                    ".FALSE." => false,
-                    _ => false,
-                })),
-                span,
-            )]
-        });
-        let string_parser =
-            string_parser().map_with_span(|s, span| vec![(Ok(Token::String(s)), span)]);
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
+        boolean_parser()
+            .or(number_parser())
+            .or(string_parser())
+            .or(variable_parser())
+    }
 
-        boolean_parser
-            .or(number_parser)
-            .or(string_parser)
-            .or(end_error_parser(&TokenError::PropertyValue).map(|v| vec![v]))
+    /// Parse a property name
+    ///
+    /// Supported
+    /// - `NAME`
+    /// - `NAME(3)`
+    /// - `NAME(3:3)`
+    /// - `NAME(3,3)`
+    //MAYBE Split Property content
+    #[inline]
+    fn property_name_parser(
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
+        let name = filter(char::is_ascii_digit)
+            .repeated()
+            .at_least(1)
+            .chain(just(':').or(just(',')).or_not())
+            .repeated()
+            .at_least(1)
+            .flatten();
+
+        filter(char::is_ascii_alphabetic)
+            .chain(filter(|c| char::is_ascii_alphanumeric(c) || *c == '_').repeated())
+            .chain::<char, _, _>(just('(').chain(name).chain(just(')')).or_not().flatten())
+            .collect::<String>()
+            .map_with_span(|text: String, span: RopeSpan| {
+                let info = if text.chars().any(|c| c.is_lowercase()) {
+                    Some(vec![TokenInfo::WarnPropertySomeLowercase])
+                } else {
+                    None
+                };
+                (Token::Property(text), span, info)
+            })
     }
 
     /// Parse a property with every assigned values.
     #[inline]
     fn property_assignment_parser(
-    ) -> impl Parser<char, Vec<(Result<Token, TokenError>, Range<usize>)>, Error = Cheap<char>>
+    ) -> impl Parser<char, Vec<(Token, RopeSpan, Option<Vec<TokenInfo>>)>, Error = Cheap<char>>
     {
-        let property_parser = property_parser()
-            .map_with_span(|s, span| (Ok(Token::Property(s.parse().unwrap())), span));
+        // HACK If the input is like `NAME = T, F = 1` the last property is seen as a boolean
+        let check_bool = none_of('=').padded().ignored().or(end().padded()).rewind();
+
+        let comma = just(',')
+            .ignored()
+            .map_with_span(|_, span| (Token::Comma, span, None))
+            .padded();
 
         let property_assignment = just('=')
             .ignored()
+            .map_with_span(|_, span| (Token::Equal, span, None))
             .padded()
-            .map_with_span(|_, span| (Ok(Token::Equal), span))
             .chain(
-                property_value_parser()
-                    .chain(
-                        just(',')
-                            .padded()
-                            .ignored()
-                            .map_with_span(|_, span| (Ok(Token::Comma), span))
-                            .chain(
-                                //Boolean
-                                just("T,")
-                                    .ignored()
-                                    .or(just("T ").ignored())
-                                    .or(just("F,").ignored())
-                                    .or(just("F ").ignored())
-                                    .or(just('.').ignored())
-                                    //Number
-                                    .or(just('-').ignored())
-                                    .or(filter(char::is_ascii_digit).ignored())
-                                    //String
-                                    .or(just('\'').ignored())
-                                    .or(just('"').ignored())
-                                    .rewind()
-                                    .to(None),
-                            )
-                            .chain(property_value_parser())
-                            .repeated()
-                            .flatten(),
-                    )
-                    .chain(
-                        whitespace()
-                            .then(
-                                just(',')
-                                    .map_with_span(|_, span| (Ok(Token::Comma), span))
-                                    .or_not(),
-                            )
-                            .map(|(_, v)| v),
-                    ),
+                property_value_parser().or(end_error_parser(&TokenInfo::ErrorUnknownPropertyValue)),
             )
-            .or(end_error_parser(&TokenError::PropertyAssignment).map(|v| vec![v]));
+            .chain(
+                comma
+                    .chain(
+                        // HACK Currently the property_value_parser is executed 2x if the bool_check fails.
+                        property_value_parser().then_ignore(check_bool),
+                    )
+                    .repeated()
+                    .flatten(),
+            )
+            .chain(comma.or_not())
+            .map(|mut vec: Vec<(Token, _, Option<Vec<TokenInfo>>)>| {
+                if let Some((token, _, vec)) = vec.last_mut() {
+                    if token != &Token::Comma {
+                        if vec.is_some() {
+                            vec.as_mut().unwrap().push(TokenInfo::HintComma)
+                        } else {
+                            *vec = Some(vec![TokenInfo::HintComma])
+                        }
+                    }
+                }
+                vec
+            });
 
-        property_parser.chain(property_assignment)
+        property_name_parser().chain(property_assignment.or(empty().map_with_span(|_, span| {
+            vec![(
+                Token::Error,
+                span,
+                Some(vec![TokenInfo::ErrorPropertyAssignmentMissing]),
+            )]
+        })))
     }
 
     /// Parse the end of a command block.
     #[inline]
     fn end_parser(
-    ) -> impl Parser<char, (Result<Token, TokenError>, Range<usize>), Error = Cheap<char>> {
-        whitespace()
-            .then(just('/').map_with_span(|_, span| (Ok(Token::End), span)))
-            .map(|(_, v)| v)
-            .or(take_until(just('&').ignored().rewind().or(end()))
-                .map_with_span(|_, span| (Err(TokenError::End), span)))
-    }
-
-    /// Parse the end, if it is an error.
-    #[inline]
-    fn end_error_parser(
-        err: &'static TokenError,
-    ) -> impl Parser<char, (Result<Token, TokenError>, Range<usize>), Error = Cheap<char>> {
-        take_until(
-            just('/')
-                .ignored()
-                .rewind()
-                .or(just('&').ignored().rewind())
-                .or(end()),
-        )
-        .map_with_span(|_, span| (Err(*err), span))
+    ) -> impl Parser<char, (Token, RopeSpan, Option<Vec<TokenInfo>>), Error = Cheap<char>> {
+        filter(char::is_ascii_whitespace)
+            .repeated()
+            .ignored()
+            .then(just('/').to(true).or(empty().to(false)))
+            .map_with_span(|(_, b), span: std::ops::Range<usize>| {
+                if b {
+                    (Token::End, (span.end - 1)..span.end, None)
+                } else {
+                    (
+                        Token::Error,
+                        span.start..(span.start + 1),
+                        Some(vec![TokenInfo::ErrorEndCharMissing]),
+                    )
+                }
+            })
     }
 
     /// Parse a whole code block.
     #[inline]
     fn script_block_code_parser(
-    ) -> impl Parser<char, (RopeBlock, Range<usize>), Error = Cheap<char>> {
-        let code_start_parser = whitespace()
-            .then(just('&').map_with_span(|_, span| (Ok(Token::Start), span)))
-            .map(|(_, v)| v);
-
-        let property_parser = property_assignment_parser();
-
-        let class_parser =
-            class_parser().map_with_span(|s, span| vec![(Ok(Token::Class(s)), span)]);
-
-        code_start_parser
-            .chain(
-                class_parser
-                    .chain(
-                        property_parser
-                            .padded()
-                            .repeated()
-                            .flatten()
-                            .chain(whitespace().to(None))
-                            .chain(
-                                just('/')
-                                    .ignored()
-                                    .rewind()
-                                    .to(None)
-                                    .or(end_error_parser(&TokenError::Property).map(Some)),
-                            ), //.or(end_error_parser(&TokenError::Property).map(|v| vec![v])),
-                    )
-                    .or(end_error_parser(&TokenError::Class).map(|v| vec![v])),
-            )
+    ) -> impl Parser<char, Vec<(Token, RopeSpan, Option<Vec<TokenInfo>>)>, Error = Cheap<char>>
+    {
+        class_parser()
+            .chain(property_assignment_parser().padded().repeated().flatten())
             .chain(end_parser())
-            .map_with_span(|v, span| (RopeBlock::Code(v), span))
     }
 
     /// Parse a comment.
     #[inline]
     fn script_block_comment_parser(
-    ) -> impl Parser<char, (RopeBlock, Range<usize>), Error = Cheap<char>> {
+    ) -> impl Parser<char, Vec<(Token, RopeSpan, Option<Vec<TokenInfo>>)>, Error = Cheap<char>>
+    {
         none_of('\n')
             .then(take_until(
                 just::<_, _, _>('\n').rewind().ignored().or(end()),
             ))
             .ignored()
-            .map_with_span(|_, span| (RopeBlock::Comment, span))
-            .then(just('\n').or_not())
-            .map(|(v, _)| v)
+            .map_with_span(|_, span| vec![(Token::Comment, span, None)])
+            .then_ignore(just('\n').or_not())
     }
 
     /// Parse the whole script.
     #[inline]
     pub(super) fn script_parser(
-    ) -> impl Parser<char, Vec<(RopeBlock, Range<usize>)>, Error = Cheap<char>> {
+    ) -> impl Parser<char, Vec<(Token, RopeSpan, Option<Vec<TokenInfo>>)>, Error = Cheap<char>>
+    {
         script_block_code_parser()
             .or(script_block_comment_parser().padded())
             .repeated()
             .at_least(1)
+            .flatten()
     }
 
-    #[test]
-    fn test_class_parser() {
-        let parser = class_parser();
-        assert_eq!(parser.parse("TEST"), Ok("TEST".to_string()),);
-    }
+    #[cfg(test)]
+    mod test {
+        use std::{ops::Range, result};
 
-    #[test]
-    fn test_number_parser() {
-        let parser = number_parser();
-        assert_eq!(
-            parser.parse("10"),
-            Ok("10".to_string()),
-            "Tested '10', expected '10'"
-        );
-        assert_eq!(
-            parser.parse("-10"),
-            Ok("-10".to_string()),
-            "Tested '-10', expected '-10'"
-        );
-        assert_eq!(
-            parser.parse("-10.2345"),
-            Ok("-10.2345".to_string()),
-            "Tested '-10.2345', expected '-10.2345'"
-        );
-        assert!(
-            parser.parse("- 10.2345").is_err(),
-            "Tested '- 10.2345', expected Error"
-        );
-    }
+        use chumsky::Parser;
 
-    #[test]
-    fn test_boolean_parser() {
-        let parser = bool_parser();
-        assert_eq!(
-            parser.parse("T"),
-            Ok("T".to_string()),
-            "Tested 'T', expected 'T'"
-        );
-        assert_eq!(
-            parser.parse("F"),
-            Ok("F".to_string()),
-            "Tested 'F', expected 'F'"
-        );
-        assert_eq!(
-            parser.parse(".TRUE."),
-            Ok(".TRUE.".to_string()),
-            "Tested  '.TRUE.', expected '.TRUE.'"
-        );
-        assert_eq!(
-            parser.parse(".FALSE."),
-            Ok(".FALSE.".to_string()),
-            "Tested ' .FALSE.', expected '.FALSE'"
-        );
-        assert!(
-            parser.parse(".True.").is_err(),
-            "Tested '.True.' expected Error, got {:?}",
-            parser.parse(".True.")
-        )
-    }
+        use crate::parser::{
+            parse_helper::{boolean_parser, script_block_code_parser},
+            Token, TokenInfo,
+        };
 
-    #[test]
-    fn test_string_parser() {
-        let parser = string_parser();
-        assert_eq!(
-            parser.parse("''"),
-            Ok("".to_string()),
-            "Tested '''', expected ''"
-        );
-        assert_eq!(
-            parser.parse("\"\""),
-            Ok("".to_string()),
-            "Tested '\"\"', expected ''"
-        );
-        assert_eq!(
-            parser.parse("'some text'"),
-            Ok("some text".to_string()),
-            "Tested ''some text'', expected 'some text'"
-        );
-        assert_eq!(
-            parser.parse("\"some text\""),
-            Ok("some text".to_string()),
-            "Tested '\"some text\"', expected 'some text'"
-        );
-        //FIXME Fore some reason \' gets converted to \\' so the test fails:
-        //  left: `Ok("some \\'quote\\' text")`,
-        // right: `Ok("some 'quote' text")`
-        // assert_eq!(
-        //     parser.parse(r"'some \'quote\' text'"),
-        //     Ok("some 'quote' text".to_string()),
-        //     "Tested  ''some \'quote\' text'', expected 'some 'quote' text'"
-        // );
-    }
+        use super::{
+            class_parser, number_parser, property_assignment_parser, property_name_parser,
+            string_parser,
+        };
 
-    #[test]
-    fn test_property_parser() {
-        let parser = property_parser();
-        assert_eq!(
-            parser.parse("TEST_PROPERTY"),
-            Ok("TEST_PROPERTY".to_string()),
-            "Tested 'TEST_PROPERTY', expected 'TEST_PROPERTY'"
-        );
-        assert_eq!(
-            parser.parse("TEST_PROPERTY(1)"),
-            Ok("TEST_PROPERTY(1)".to_string()),
-            "Tested '\"\"', expected ''"
-        );
-        assert_eq!(
-            parser.parse("TEST_PROPERTY(1:6,1)"),
-            Ok("TEST_PROPERTY(1:6,1)".to_string()),
-            "Tested 'TEST_PROPERTY(1:6,1)', expected 'TEST_PROPERTY(1:6,1)'"
-        );
-        assert_eq!(
-            parser.parse("TEST_PROPERTY(1:2)"),
-            Ok("TEST_PROPERTY(1:2)".to_string()),
-            "Tested 'TEST_PROPERTY(1:2)', expected 'TEST_PROPERTY(1:2)'"
-        );
-        assert_eq!(
-            parser.parse("TEST_PROPERTY(1,1)"),
-            Ok("TEST_PROPERTY(1,1)".to_string()),
-            "Tested  'TEST_PROPERTY(1,1)', expected 'TEST_PROPERTY(1,1)'"
-        );
-    }
+        fn get_value<O, E>(result: Result<O, E>) -> O {
+            match result {
+                Ok(ok) => ok,
+                Err(_) => panic!("An Ok value is expected!"),
+            }
+        }
+        fn unzip(
+            result: Vec<(Token, Range<usize>, Option<Vec<TokenInfo>>)>,
+        ) -> (Vec<Token>, Vec<TokenInfo>) {
+            let (t, s): (Vec<Token>, Vec<Option<Vec<TokenInfo>>>) =
+                result.into_iter().map(|f| (f.0, f.2)).unzip();
+            let s = s.into_iter().flatten().flatten().collect();
+            (t, s)
+        }
 
-    #[test]
-    fn test_end_parser() {
-        let parser = end_parser();
-        assert_eq!(
-            parser.parse("   / Some Comment"),
-            Ok((Ok(Token::End), 3..4))
-        );
-        assert_eq!(
-            parser.parse("Some Text that could not be parsed / Some Comment"),
-            Ok((Err(TokenError::End), 0..49))
-        );
-    }
-    #[test]
+        #[test]
+        fn test_class_parser() {
+            let parser = class_parser();
 
-    fn test_end_error_parser() {
-        let parser = end_error_parser(&TokenError::End);
-        assert_eq!(
-            parser.parse("Some Text that could not be parsed / Some Comment"),
-            Ok((Err(TokenError::End), 0..35))
-        );
-    }
+            let result = get_value(parser.parse("&MATL"));
+            let tokens = result.into_iter().map(|(t, _, _)| t).collect::<Vec<_>>();
+            assert_eq!(vec![Token::Start, Token::Class("MATL".to_string())], tokens);
 
-    #[test]
-    fn test_script_comment_parser() {
-        let parser = script_block_comment_parser();
-        assert_eq!(
-            parser.parse("Some Comment\nMore Comment"),
-            Ok((RopeBlock::Comment, 0..12))
-        );
-        assert_eq!(
-            parser.repeated().parse("Some Comment\nMore Comment"),
-            Ok(vec![
-                (RopeBlock::Comment, 0..12),
-                (RopeBlock::Comment, 13..25)
-            ])
-        );
-    }
+            let result = get_value(parser.parse("& MATL"));
+            let suggestions = result
+                .into_iter()
+                .filter_map(|(_, _, s)| s)
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(vec![TokenInfo::ErrorClassNameMissing], suggestions);
 
-    #[test]
-    fn test_property_value_parser() {
-        let parser = property_value_parser();
+            let result = get_value(parser.parse("&Material"));
+            let suggestions = result
+                .into_iter()
+                .filter_map(|(_, _, s)| s)
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(vec![TokenInfo::WarnClassNameLength], suggestions);
+        }
 
-        let parsed = parser.parse("T");
-        assert_eq!(parsed, Ok(vec![(Ok(Token::Boolean(true)), 0..1)]));
-        let parsed = parser.parse("'string'");
-        assert_eq!(
-            parsed,
-            Ok(vec![(Ok(Token::String("string".to_string())), 0..8)])
-        );
-        let parsed = parser.parse("-100");
-        assert_eq!(parsed, Ok(vec![(Ok(Token::Number(-100.0)), 0..4)]));
-        let parsed = parser.parse("fail");
-        assert_eq!(parsed, Ok(vec![(Err(TokenError::PropertyValue), 0..4),]));
-    }
+        #[test]
+        fn test_number_parser() {
+            let parser = number_parser();
 
-    #[test]
-    fn test_property_assignment_parser() {
-        let parser = property_assignment_parser();
+            let result = get_value(parser.parse("-1.2345e10"));
+            let number = result.0;
+            assert_eq!(Token::Number(-1.2345e10), number);
+        }
 
-        let parsed = parser.parse("PROP=1");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Ok(Token::Number(1.0)), 5..6)
-            ])
-        );
-        let parsed = parser.parse("PROP=1,2");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Ok(Token::Number(1.0)), 5..6),
-                (Ok(Token::Comma), 6..7),
-                (Ok(Token::Number(2.0)), 7..8)
-            ])
-        );
-        let parsed = parser.parse("PROP=1,2 PROP=1,2");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Ok(Token::Number(1.0)), 5..6),
-                (Ok(Token::Comma), 6..7),
-                (Ok(Token::Number(2.0)), 7..8)
-            ])
-        );
-        let parsed = parser.parse("PROP=1,2,");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Ok(Token::Number(1.0)), 5..6),
-                (Ok(Token::Comma), 6..7),
-                (Ok(Token::Number(2.0)), 7..8),
-                (Ok(Token::Comma), 8..9)
-            ])
-        );
-        let parsed = parser.parse("PROP=1,2 , PROP=1,2");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Ok(Token::Number(1.0)), 5..6),
-                (Ok(Token::Comma), 6..7),
-                (Ok(Token::Number(2.0)), 7..8),
-                (Ok(Token::Comma), 9..10)
-            ])
-        );
-        let parsed = parser.parse("PROP='string");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (Ok(Token::Property("PROP".to_string())), 0..4),
-                (Ok(Token::Equal), 4..5),
-                (Err(TokenError::PropertyValue), 5..12),
-            ])
-        );
-    }
+        #[test]
+        fn test_boolean_parser() {
+            let parser = boolean_parser();
+            let result = get_value(parser.parse("T"));
+            assert_eq!(Token::Boolean(true), result.0);
+            assert_eq!(Some(vec![TokenInfo::HintUseVerboseBoolean]), result.2);
 
-    #[test]
-    fn test_script_block_code_parser() {
-        let parsed = script_block_code_parser().parse("&CLASS PROPERTY=.TRUE. /");
-        assert_eq!(
-            parsed,
-            Ok((
-                RopeBlock::Code(vec![
-                    (Ok(Token::Start), 0..1),
-                    (Ok(Token::Class("CLASS".to_string())), 1..6),
-                    (Ok(Token::Property("PROPERTY".to_string())), 7..15),
-                    (Ok(Token::Equal), 15..16),
-                    (Ok(Token::Boolean(true)), 16..22),
-                    (Ok(Token::End), 23..24)
-                ]),
-                0..24
-            ))
-        );
-        let parsed = script_block_code_parser().parse("&CLASSPROPERTY=.TRUE./");
-        assert_eq!(
-            parsed,
-            Ok((
-                RopeBlock::Code(vec![
-                    (Ok(Token::Start), 0..1),
-                    (Ok(Token::Class("CLASSPROPERTY".to_string())), 1..14),
-                    (Err(TokenError::Property), 14..21),
-                    (Ok(Token::End), 21..22)
-                ]),
-                0..22
-            ))
-        );
-        let parsed = script_block_code_parser().parse("  &CLASS  PROPERTY = 1 , 2 , 3/");
-        assert_eq!(
-            parsed,
-            Ok((
-                RopeBlock::Code(vec![
-                    (Ok(Token::Start), 2..3),
-                    (Ok(Token::Class("CLASS".to_string())), 3..8),
-                    (Ok(Token::Property("PROPERTY".to_string())), 10..18),
-                    (Ok(Token::Equal), 18..21),
-                    (Ok(Token::Number(1.0)), 21..22),
-                    (Ok(Token::Comma), 22..25),
-                    (Ok(Token::Number(2.0)), 25..26),
-                    (Ok(Token::Comma), 26..29),
-                    (Ok(Token::Number(3.0)), 29..30),
-                    (Ok(Token::End), 30..31)
-                ]),
-                0..31
-            ))
-        );
-    }
+            let result = get_value(parser.parse(".TRUE."));
+            assert_eq!(Token::Boolean(true), result.0);
+            assert_eq!(None, result.2);
 
-    #[test]
-    fn test_script_parser() {
-        let parser = script_parser();
-        let parsed = parser.parse("Comment\nComment");
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (RopeBlock::Comment, 0..7),
-                (RopeBlock::Comment, 8..15)
-            ])
-        );
-        let parsed = parser.parse(
-            "Comment\n&CLASS PROPERTY=T/ Comment\n&CLASS PROPERTY=T/\nComment\n&CLASS PROPERTY=T/\nComment",
-        );
-        assert_eq!(
-            parsed,
-            Ok(vec![
-                (RopeBlock::Comment, 0..7),
-                (
-                    RopeBlock::Code(vec![
-                        (Ok(Token::Start), 8..9),
-                        (Ok(Token::Class("CLASS".to_string())), 9..14),
-                        (Ok(Token::Property("PROPERTY".to_string())), 15..23),
-                        (Ok(Token::Equal), 23..24),
-                        (Ok(Token::Boolean(true)), 24..25),
-                        (Ok(Token::End), 25..26)
-                    ]),
-                    8..26
-                ),
-                (RopeBlock::Comment, 27..34),
-                (
-                    RopeBlock::Code(vec![
-                        (Ok(Token::Start), 35..36),
-                        (Ok(Token::Class("CLASS".to_string())), 36..41),
-                        (Ok(Token::Property("PROPERTY".to_string())), 42..50),
-                        (Ok(Token::Equal), 50..51),
-                        (Ok(Token::Boolean(true)), 51..52),
-                        (Ok(Token::End), 52..53)
-                    ]),
-                    35..53
-                ),
-                (RopeBlock::Comment, 54..61),
-                (
-                    RopeBlock::Code(vec![
-                        (Ok(Token::Start), 62..63),
-                        (Ok(Token::Class("CLASS".to_string())), 63..68),
-                        (Ok(Token::Property("PROPERTY".to_string())), 69..77),
-                        (Ok(Token::Equal), 77..78),
-                        (Ok(Token::Boolean(true)), 78..79),
-                        (Ok(Token::End), 79..80)
-                    ]),
-                    62..80
-                ),
-                (RopeBlock::Comment, 81..88)
-            ])
-        );
+            let result = get_value(parser.parse("F"));
+            assert_eq!(Token::Boolean(false), result.0);
+            assert_eq!(Some(vec![TokenInfo::HintUseVerboseBoolean]), result.2);
+
+            let result = get_value(parser.parse(".FALSE."));
+            assert_eq!(Token::Boolean(false), result.0);
+            assert_eq!(None, result.2);
+
+            if parser.parse(".False.").is_ok() {
+                panic!("An Err value is expected!")
+            }
+        }
+
+        #[test]
+        fn test_string_parser() {
+            let parser = string_parser();
+
+            let result = get_value(parser.parse("\"text\""));
+            assert_eq!(Token::String("text".to_string()), result.0);
+            assert_eq!(None, result.2);
+
+            let result = get_value(parser.parse("'text'"));
+            assert_eq!(Token::String("text".to_string()), result.0);
+            assert_eq!(Some(vec![TokenInfo::HintUseDoubleQuotes]), result.2);
+        }
+
+        #[test]
+        fn test_property_name_parser() {
+            let parser = property_name_parser();
+
+            let result = get_value(parser.parse("NAME"));
+            assert_eq!(Token::Property("NAME".to_string()), result.0);
+
+            let result = get_value(parser.parse("NAME(3)"));
+            assert_eq!(Token::Property("NAME(3)".to_string()), result.0);
+
+            let result = get_value(parser.parse("NAME(3:3)"));
+            assert_eq!(Token::Property("NAME(3:3)".to_string()), result.0);
+
+            let result = get_value(parser.parse("NAME(3,3)"));
+            assert_eq!(Token::Property("NAME(3,3)".to_string()), result.0);
+        }
+
+        #[test]
+        fn test_property_assignment_parser() {
+            let parser = property_assignment_parser();
+
+            let result = get_value(parser.parse("NAME = 1"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0)
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1,"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1,2,3"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::Number(3.0),
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1,2,3,"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::Number(3.0),
+                    Token::Comma,
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1 OTHER = 1"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0)
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1, OTHER = 1"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1,2,3 OTHER = 1"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::Number(3.0),
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = 1,2,3, OTHER = 1"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::Number(3.0),
+                    Token::Comma,
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = F"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Boolean(false)
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = F,"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Boolean(false),
+                    Token::Comma
+                ],
+                t
+            );
+            let result = get_value(parser.parse("NAME = F, F = 1.0"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Boolean(false),
+                    Token::Comma
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = F F = 1.0"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Property("NAME".to_string()),
+                    Token::Equal,
+                    Token::Boolean(false)
+                ],
+                t
+            );
+
+            let result = get_value(parser.parse("NAME = Unknown"));
+            let (t, s) = unzip(result);
+            assert_eq!(vec![TokenInfo::ErrorUnknownPropertyValue], s);
+
+            let result = get_value(parser.parse("NAME = "));
+            let (t, s) = unzip(result);
+            assert_eq!(vec![TokenInfo::ErrorUnknownPropertyValue], s);
+
+            let result = get_value(parser.parse("NAME = ,"));
+            let (t, s) = unzip(result);
+            assert_eq!(vec![TokenInfo::ErrorUnknownPropertyValue], s);
+        }
+
+        #[test]
+        fn test_script_block_code_parser() {
+            let parser = script_block_code_parser();
+
+            let result = get_value(parser.parse("&NAME PROP = 1, PROP = 2, /"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Start,
+                    Token::Class("NAME".to_string()),
+                    Token::Property("PROP".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Property("PROP".to_string()),
+                    Token::Equal,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::End
+                ],
+                t
+            );
+            assert_eq!(Vec::<TokenInfo>::new(), s);
+
+            let result = get_value(parser.parse("&NAME PROP = 1, PROP = 2,"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Start,
+                    Token::Class("NAME".to_string()),
+                    Token::Property("PROP".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Property("PROP".to_string()),
+                    Token::Equal,
+                    Token::Number(2.0),
+                    Token::Comma,
+                    Token::Error
+                ],
+                t
+            );
+            assert_eq!(vec![TokenInfo::ErrorEndCharMissing], s);
+
+            let result = get_value(parser.parse("&NAME PROP = T,F, F = 1.0"));
+            let (t, s) = unzip(result);
+            assert_eq!(
+                vec![
+                    Token::Start,
+                    Token::Class("NAME".to_string()),
+                    Token::Property("PROP".to_string()),
+                    Token::Equal,
+                    Token::Boolean(true),
+                    Token::Comma,
+                    Token::Boolean(false),
+                    Token::Comma,
+                    Token::Property("F".to_string()),
+                    Token::Equal,
+                    Token::Number(1.0),
+                    Token::Error
+                ],
+                t
+            );
+            assert_eq!(
+                vec![
+                    TokenInfo::HintUseVerboseBoolean,
+                    TokenInfo::HintUseVerboseBoolean,
+                    TokenInfo::ErrorEndCharMissing
+                ],
+                s
+            );
+        }
     }
 }

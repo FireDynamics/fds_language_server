@@ -4,11 +4,11 @@ use std::{error::Error, fmt::Display, ops::Index};
 
 use serde_json::Value;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionParams, CompletionResponse, MessageType, Position,
+    CompletionItem, CompletionParams, CompletionResponse, MessageType, Range,
 };
 
 use crate::{
-    parser::{Block, Token, TokenError},
+    parser::Token,
     versions::{Version, VersionValueError},
     Backend,
 };
@@ -17,13 +17,12 @@ use tower_lsp::jsonrpc::Result;
 
 /// The errors that can occur while auto completion
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum CompletionResponseError {
     /// The Script is missing
     NoScript(String),
     /// No Version could be found
     NoVersion(String),
-    // No codeblock at a given Position
-    NoBlockAtPosition(Position),
 }
 
 impl Display for CompletionResponseError {
@@ -37,9 +36,6 @@ impl Display for CompletionResponseError {
                 f,
                 "script for the current document could not be found '{document}'"
             ),
-            CompletionResponseError::NoBlockAtPosition(position) => {
-                write!(f, "no block at position '{position:?}'")
-            }
         }
     }
 }
@@ -55,7 +51,7 @@ impl From<CompletionResponseError> for tower_lsp::jsonrpc::Error {
 }
 
 /// Get the completion response for all supported systems
-/// 
+///
 /// Currently supported:
 /// - default classes and properties
 /// - default values
@@ -64,6 +60,40 @@ pub async fn get_completion_response(
     backend: &Backend,
     params: CompletionParams,
 ) -> Result<Option<CompletionResponse>> {
+    /// Helper function to get the closest property and class name.
+    /// The iterator is wandered until the start of the current code block.
+    /// the fist property and the class are returned.
+    fn closest_property_and_class<'a>(
+        iter: impl Iterator<Item = (Range, &'a Token)>,
+    ) -> Option<(&'a str, &'a str)> {
+        let mut iter = iter
+            .map(|f| f.1)
+            .take_while(|f| !matches!(f, Token::Start))
+            .filter(|f| matches!(f, Token::Class(_) | Token::Property(_)));
+        if let (Some(Token::Property(property_name)), Some(Token::Class(class_name))) =
+            (iter.next(), iter.last())
+        {
+            Some((property_name, class_name))
+        } else {
+            None
+        }
+    }
+
+    /// Helper function to get the closest class name.
+    /// The iterator is wandered until the start of the current code block.
+    /// The class is returned.
+    fn closest_class<'a>(iter: impl Iterator<Item = (Range, &'a Token)>) -> Option<&'a str> {
+        if let Some(Token::Class(class_name)) = iter
+            .map(|f| f.1)
+            .take_while(|f| !matches!(f, Token::Start))
+            .find(|f| matches!(f, Token::Class(_)))
+        {
+            Some(class_name)
+        } else {
+            None
+        }
+    }
+
     let uri = params.text_document_position.text_document.uri.to_string();
     let Some(script) = backend.script_map.get(&uri) else {
         let err = CompletionResponseError::NoScript(uri);
@@ -77,39 +107,118 @@ pub async fn get_completion_response(
     };
 
     let pos = params.text_document_position.position;
-    let Some(block) = script.get_block(pos) else {
-        let err = CompletionResponseError::NoBlockAtPosition(pos);
-        backend.error(format!("{err}")).await;
-        return Err(err.into());
 
-    };
-    let result = block._get_token(pos);
+    let mut iter = script.iter().map(|f| (f.span.lsp_span, &f.token)).rev();
 
-    match result {
-        //Classes
-        Some((Ok(Token::Start), _)) | Some((Ok(Token::Class(_)), _)) => {
-            let items = get_completion_classes(backend, &version);
-            return Ok(items);
-        }
-        //Properties
-        Some((Ok(Token::Property(_)), _))
-        | Some((Err(TokenError::Property), _))
-        | Some((Err(TokenError::End), _))
-        | None => {
-            let items = get_completion_properties(backend, &block, &version);
-            return Ok(items);
-        }
-        Some((Ok(Token::Equal), _))
-        | Some((Ok(Token::Comma), _))
-        | Some((Err(TokenError::PropertyValue), _)) => {
-            let items = get_completion_equal(backend, &block, pos, &uri, &version);
-            return Ok(items);
-        }
-        _ => {
-            backend
-                .client
-                .log_message(MessageType::INFO, "No completion item found.")
-                .await;
+    while let Some((range, token)) = iter.next() {
+        if range.start <= pos && range.end >= pos {
+            match token {
+                crate::Token::Start | crate::Token::Class(_) => {
+                    let items = get_completion_classes(backend, &version);
+                    return Ok(items);
+                }
+                crate::Token::Property(_) => {
+                    if let Some(class_name) = closest_class(iter) {
+                        let items = get_completion_properties(backend, class_name, &version)
+                            .map(|f| f.into());
+                        return Ok(items);
+                    }
+                }
+                crate::Token::Equal => {
+                    if let Some((property_name, class_name)) = closest_property_and_class(iter) {
+                        let items = get_completion_equal(
+                            backend,
+                            class_name,
+                            property_name,
+                            &uri,
+                            &version,
+                        );
+                        return Ok(items.map(|f| f.into()));
+                    }
+                }
+                crate::Token::Comma => {
+                    if let Some((property_name, class_name)) = closest_property_and_class(iter) {
+                        let items_property =
+                            get_completion_properties(backend, class_name, &version);
+                        let items_equal = get_completion_equal(
+                            backend,
+                            class_name,
+                            property_name,
+                            &uri,
+                            &version,
+                        );
+
+                        let items = match (items_property, items_equal) {
+                            (None, None) => None,
+                            (None, Some(items)) | (Some(items), None) => Some(items.into()),
+                            (Some(items_property), Some(items_equal)) => {
+                                Some([items_property, items_equal].concat().into())
+                            }
+                        };
+                        return Ok(items);
+                    }
+                }
+                crate::Token::Error => {
+                    continue;
+                }
+                _ => {}
+            }
+            break;
+        } else if range.end < pos {
+            match token {
+                // Wenn Comma, oder Klasse zuvor sind
+                crate::Token::Class(class_name) => {
+                    let items =
+                        get_completion_properties(backend, class_name, &version).map(|f| f.into());
+                    return Ok(items);
+                }
+                crate::Token::Property(_)
+                | crate::Token::Number(_)
+                | crate::Token::Boolean(_)
+                | crate::Token::String(_) => {
+                    if let Some(class_name) = closest_class(iter) {
+                        let items = get_completion_properties(backend, class_name, &version)
+                            .map(|f| f.into());
+                        return Ok(items);
+                    }
+                }
+                crate::Token::Equal => {
+                    if let Some((property_name, class_name)) = closest_property_and_class(iter) {
+                        let items = get_completion_equal(
+                            backend,
+                            class_name,
+                            property_name,
+                            &uri,
+                            &version,
+                        );
+                        return Ok(items.map(|f| f.into()));
+                    }
+                }
+                crate::Token::Comma => {
+                    if let Some((property_name, class_name)) = closest_property_and_class(iter) {
+                        let items_property =
+                            get_completion_properties(backend, class_name, &version);
+                        let items_equal = get_completion_equal(
+                            backend,
+                            class_name,
+                            property_name,
+                            &uri,
+                            &version,
+                        );
+
+                        let items = match (items_property, items_equal) {
+                            (None, None) => None,
+                            (None, Some(items)) | (Some(items), None) => Some(items.into()),
+                            (Some(items_property), Some(items_equal)) => {
+                                Some([items_property, items_equal].concat().into())
+                            }
+                        };
+                        return Ok(items);
+                    }
+                }
+                _ => {}
+            }
+            break;
         }
     }
 
@@ -119,60 +228,60 @@ pub async fn get_completion_response(
 /// Get the completion response for classes
 fn get_completion_classes(backend: &Backend, version: &Version) -> Option<CompletionResponse> {
     let items = backend
-    .fds_classes_map
-    .get(version)?
-    .values()
-    .map(|f| f.get_completion_item(*version))
-    .collect::<Vec<_>>();
-Some(items.into())
+        .fds_classes_map
+        .get(version)?
+        .values()
+        .map(|f| f.get_completion_item(*version))
+        .collect::<Vec<_>>();
+    Some(items.into())
 }
 
 /// Get the completion response for properties
 fn get_completion_properties(
     backend: &Backend,
-    block: &Block,
+    class_name: &str,
     version: &Version,
-) -> Option<CompletionResponse> {
-    let name = block.get_name()?;
-    let class = backend.fds_classes_map.get(&version)?;
-    let class = class.get(&name)?;
-    let items = class
-        .properties
-        .values()
-        .map(|v| v.get_completion_item(class.label.clone(), *version))
-        .collect::<Vec<_>>();
-    Some(items.into())
+) -> Option<Vec<CompletionItem>> {
+    let class = backend.fds_classes_map.get(version)?;
+    let class = class.get(class_name)?;
+    Some(
+        class
+            .properties
+            .values()
+            .map(|v| v.get_completion_item(class.label.clone(), *version))
+            .collect(),
+    )
 }
 
 /// Get the completion response for property values
 fn get_completion_equal(
     backend: &Backend,
-    block: &Block,
-    pos: Position,
+    class_name: &str,
+    property_name: &str,
     uri: &String,
     version: &Version,
-) -> Option<CompletionResponse> {
-    let class = block.get_name()?;
-    let (property, _) = block.get_recent_property(pos)?;
-
-    let fds_defaults = backend.fds_defaults_map.get(&version)?;
+) -> Option<Vec<CompletionItem>> {
+    let fds_defaults = backend.fds_defaults_map.get(version)?;
 
     let mut completion_items = fds_defaults
         .iter()
         .enumerate()
-        .filter(|(_, fds_default)| fds_default.is_item(&class, &property))
+        .filter(|(_, fds_default)| fds_default.is_item(class_name, property_name))
         .flat_map(|(i, fds_default)| fds_default.get_completion_items(i, *version))
         .collect::<Vec<_>>();
 
-    if property.ends_with("_ID") {
+    if property_name.ends_with("_ID") {
         if let Some(context_map) = backend.context_map.get(uri) {
-            let class = property[..(property.len() - 3)].to_string();
+            let class = property_name
+                .strip_suffix("_ID")
+                .expect("Always has suffix.")
+                .to_string();
             let mut items = context_map.get_completion_items(&class);
             completion_items.append(&mut items);
         }
     }
 
-    Some(completion_items.into())
+    Some(completion_items)
 }
 
 /// All errors that can occur by converting a [`Value`] to a [`CompletionItemValue`]
@@ -269,7 +378,6 @@ pub enum CompletionItemValue {
         line: u32,
         /// The char where the context value starts
         character: u32,
-        //TODO Range
     },
 }
 impl TryFrom<&Value> for CompletionItemValue {
@@ -414,31 +522,14 @@ pub async fn set_completion_response(backend: &Backend, params: &mut CompletionI
     // Get the markdown based on the value
     match completion_item_value {
         CompletionItemValue::Class { version } => {
-            backend
-                .client
-                .log_message(MessageType::INFO, "Get Class")
-                .await;
             let Some(class) = backend.fds_classes_map.get(&version) else {return};
-            backend
-                .client
-                .log_message(MessageType::INFO, "Get Class")
-                .await;
             let Some(class) = class.get(&params.label) else {return};
-            backend
-                .client
-                .log_message(MessageType::INFO, "Got Class")
-                .await;
-
             params.documentation = Some(tower_lsp::lsp_types::Documentation::MarkupContent(
                 tower_lsp::lsp_types::MarkupContent {
                     kind: tower_lsp::lsp_types::MarkupKind::Markdown,
                     value: class.to_markdown_string(),
                 },
             ));
-            backend
-                .client
-                .log_message(MessageType::INFO, class.to_markdown_string())
-                .await;
         }
         CompletionItemValue::Property {
             version,
